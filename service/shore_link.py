@@ -5,8 +5,11 @@ to shore in batches. If shore can't be reached (link down), records stay queued
 and go out on the next successful contact. The boat always starts the exchange,
 like a satellite modem would.
 
-v1: telemetry only, queue kept in memory. Later: persist the queue to disk and
-read a pending mission from the server's reply.
+Telemetry is a queue (every record matters). The plan is a single slot: only the
+latest plan matters, it is re-sent until shore acks it (POST /api/plan).
+
+Queue kept in memory. Later: persist the queue to disk and read a pending mission
+from the server's reply.
 """
 import json
 import threading
@@ -24,6 +27,8 @@ class ShoreLink:
         self.every_s = every_s        # wall-clock contact interval
         self.queue = deque(maxlen=MAX_QUEUE)
         self.lock = threading.Lock()
+        self.plan_url = url.rsplit("/api/", 1)[0] + "/api/plan"
+        self.pending_plan = None      # latest plan not yet acked by shore
         self.link_up = False
 
     def start(self):
@@ -33,17 +38,33 @@ class ShoreLink:
         with self.lock:
             self.queue.append(record)
 
+    def send_plan(self, plan):
+        """Replace any unsent plan with this one; it goes out on the next contact."""
+        with self.lock:
+            self.pending_plan = plan
+
+    def _post(self, url, payload):
+        req = urllib.request.Request(url, data=json.dumps(payload).encode(),
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10).read()
+
     def _run(self):
         while True:
             time.sleep(self.every_s)
             with self.lock:
                 batch = list(self.queue)[:MAX_BATCH]
-            if not batch:
+                plan = self.pending_plan
+            if not batch and plan is None:
                 continue
             try:
-                req = urllib.request.Request(self.url, data=json.dumps(batch).encode(),
-                                             headers={"Content-Type": "application/json"})
-                urllib.request.urlopen(req, timeout=5).read()
+                if plan is not None:
+                    self._post(self.plan_url, plan)
+                    with self.lock:
+                        if self.pending_plan is plan:   # a newer plan may have arrived meanwhile
+                            self.pending_plan = None
+                    print(f"shore_link: plan {plan.get('plan_id')} delivered")
+                if batch:
+                    self._post(self.url, batch)
             except OSError as e:
                 if self.link_up:
                     print(f"shore_link: link DOWN ({e}); {len(self.queue)} records queued")

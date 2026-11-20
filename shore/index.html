@@ -7,17 +7,35 @@
 <style>
   body { font-family: system-ui, sans-serif; margin: 24px; color: #222; background: #fafafa; }
   h1 { margin: 0 0 4px; font-size: 22px; }
+  #top { display: flex; align-items: center; justify-content: space-between; }
+  #reset { font-size: 13px; padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
+  #reset:hover { background: #fdecec; border-color: #b42318; color: #b42318; }
   #status { margin-bottom: 16px; font-size: 14px; color: #555; }
+  #plan { margin-bottom: 16px; font-size: 14px; color: #555; }
+  #plan b.bad { color: #b42318; } #plan b.good { color: #1a7f37; }
   #status b.ok { color: #1a7f37; } #status b.stale { color: #b42318; }
   .card { background: #fff; border: 1px solid #e3e3e3; border-radius: 8px; padding: 8px; margin-bottom: 16px; }
   .plot { height: 320px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .grid .card { margin-bottom: 0; min-width: 0; }
+  .card.empty { border-style: dashed; background: transparent; }
+  .placeholder { display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 14px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
-<h1>Scout — shore view</h1>
+<div id="top">
+  <h1>Scout — shore view</h1>
+  <button id="reset" title="Archive the telemetry on shore and start fresh (the plan is kept)">Reset data</button>
+</div>
 <div id="status">Waiting for data…</div>
-<div class="card"><div id="volt" class="plot"></div></div>
-<div class="card"><div id="power" class="plot"></div></div>
+<div id="plan">No plan received yet.</div>
+<div class="grid">
+  <div class="card"><div id="volt" class="plot"></div></div>
+  <div class="card"><div id="power" class="plot"></div></div>
+  <div class="card"><div id="speed" class="plot"></div></div>
+  <div class="card empty"><div class="plot placeholder">(reserved for a future plot)</div></div>
+</div>
 
 <script>
 const STALE_AFTER_S = 30;   // wall-clock seconds without contact before we call the link stale
@@ -33,27 +51,43 @@ function withGaps(records, key) {
   const x = [], y = [];
   records.forEach((r, i) => {
     if (i > 0 && typical > 0 && r.t - records[i - 1].t > GAP_FACTOR * typical) {
-      x.push(new Date((records[i - 1].t + typical) * 1000)); y.push(null);
+      x.push(utc(records[i - 1].t + typical)); y.push(null);
     }
-    x.push(new Date(r.t * 1000));
+    x.push(utc(r.t));
     y.push(r[key] === undefined ? null : r[key]);
   });
   return { x, y };
 }
 
+// Plotly draws Date objects in the browser's local time; a naive ISO string is drawn as-is (= UTC).
+function utc(t) { return new Date(t * 1000).toISOString().slice(0, 19); }
+
+const CFG = { responsive: true };   // plots follow the grid column width
+
 function fmt(t) { return new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC"; }
 
 async function refresh() {
-  let data;
+  let data, plan;
   try {
-    data = await (await fetch("/api/telemetry")).json();
+    [data, plan] = await Promise.all([fetch("/api/telemetry").then(x => x.json()),
+                                      fetch("/api/plan").then(x => x.json())]);
   } catch (e) {
     document.getElementById("status").textContent = "Shore server not reachable.";
     return;
   }
   const r = data.records;
-  if (!r.length) return;
+  const hasPlan = plan && plan.series;
+  if (hasPlan) {
+    const s = plan.summary;
+    document.getElementById("plan").innerHTML =
+      `Plan <b>${plan.plan_id}</b> (${plan.planner}) made at ${fmt(plan.created_t)} · ` +
+      `${plan.route_km} km · arrival ${s.arrival ? s.arrival.replace("T", " ").replace("Z", " UTC") : "—"} · ` +
+      `min ${s.min_v.toFixed(2)} V (reserve ${plan.reserve_v} V) · ` +
+      (s.feasible ? `<b class="good">feasible</b>` : `<b class="bad">NOT feasible</b> (${s.min_under_reserve} min under reserve)`);
+  }
+  if (!r.length && !hasPlan) return;
 
+  if (r.length) {
   const last = r[r.length - 1];
   const ago = data.last_contact ? (Date.now() / 1000 - data.last_contact) : Infinity;
   const linkTxt = ago < STALE_AFTER_S
@@ -64,19 +98,60 @@ async function refresh() {
     `${linkTxt} · boat time ${fmt(last.t)} · ${last.mode} · ` +
     `${lastV ? lastV.batt_v.toFixed(2) + " V" : "no battery data"} · ` +
     `Starlink ${last.starlink ? "on" : "off"} · ${r.length} records`;
+  }
 
   const layout = (title, ytitle) => ({
     title: { text: title, font: { size: 15 } }, margin: { t: 40, r: 20, b: 40, l: 55 },
     xaxis: { title: "boat time (UTC)" }, yaxis: { title: ytitle }, legend: { orientation: "h" },
   });
-  Plotly.react("volt", [
+  const voltTraces = [
     { ...withGaps(r, "batt_v"), name: "Battery voltage (actual)", mode: "lines", line: { color: "#222" }, connectgaps: false },
-  ], layout("Battery voltage", "V"));
-  Plotly.react("power", [
-    { ...withGaps(r, "solar_w"), name: "Solar", mode: "lines", line: { color: "#e8a317" }, connectgaps: false },
-    { ...withGaps(r, "load_w"), name: "Load", mode: "lines", line: { color: "#2f6fb0" }, connectgaps: false },
-  ], layout("Power", "W"));
+  ];
+  if (hasPlan) {
+    const px = plan.series.t.map(utc);
+    voltTraces.push(
+      { x: px, y: plan.series.v_batt, name: "Battery voltage (planned)", mode: "lines",
+        line: { color: "#d9480f", dash: "dash" } },
+      { x: [px[0], px[px.length - 1]], y: [plan.reserve_v, plan.reserve_v], name: `Reserve ${plan.reserve_v} V`,
+        mode: "lines", line: { color: "#b42318", width: 1, dash: "dot" } });
+  }
+  Plotly.react("volt", voltTraces, layout("Battery voltage: actual vs plan", "V"), CFG);
+  const powerTraces = [
+    { ...withGaps(r, "solar_w"), name: "Solar (actual)", mode: "lines", line: { color: "#e8a317" }, connectgaps: false },
+    { ...withGaps(r, "load_w"), name: "Load (actual)", mode: "lines", line: { color: "#2f6fb0" }, connectgaps: false },
+  ];
+  if (hasPlan) {
+    const px = plan.series.t.map(utc);
+    powerTraces.push(
+      { x: px, y: plan.series.solar_w, name: "Solar (planned)", mode: "lines",
+        line: { color: "#e8a317", dash: "dot", width: 1.5 }, opacity: 0.8 },
+      { x: px, y: plan.series.load_w, name: "Load (planned)", mode: "lines",
+        line: { color: "#2f6fb0", dash: "dot", width: 1.5 }, opacity: 0.8 });
+  }
+  Plotly.react("power", powerTraces, layout("Power: actual vs plan", "W"), CFG);
+
+  const speedTraces = [
+    { ...withGaps(r, "speed"), name: "Speed (actual, GPS)", mode: "lines", line: { color: "#2b8a3e" }, connectgaps: false },
+  ];
+  if (hasPlan) {
+    speedTraces.push({ x: plan.series.t.map(utc), y: plan.series.speed, name: "Speed (planned)", mode: "lines",
+                       line: { color: "#2b8a3e", dash: "dot", width: 1.5, shape: "hv" }, opacity: 0.8 });
+  }
+  Plotly.react("speed", speedTraces, layout("Speed: actual vs plan", "m/s"), CFG);
 }
+
+document.getElementById("reset").addEventListener("click", async () => {
+  if (!confirm("Clear the telemetry for a new mission? (Archived on shore, the plan is kept.)")) return;
+  try {
+    await fetch("/api/reset", { method: "POST" });
+  } catch (e) {
+    alert("Shore server not reachable.");
+    return;
+  }
+  ["volt", "power", "speed"].forEach(id => Plotly.purge(id));
+  document.getElementById("status").textContent = "Data cleared. Waiting for data…";
+  refresh();
+});
 
 refresh();
 setInterval(refresh, 5000);

@@ -10,3 +10,4 @@ sim/logs/
 shore/data/
 claude/
 .venv/
+service/state/
