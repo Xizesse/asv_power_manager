@@ -1,0 +1,17 @@
+# Scout SITL parameters, loaded by sim/run_sitl.sh.
+# Applied as defaults: after editing, restart once with -w.
+
+# Battery: the env sim publishes BATTERY_STATUS 0/1/2 itself, so SITL's own is off
+BATT_MONITOR 0
+
+# Starlink power relay on output 9 (service sends DO_SET_SERVO 9 1900=on / 1100=off)
+SERVO9_FUNCTION 0
+SERVO9_TRIM 1900
+
+# No GCS/radio failsafes in sim (MAVProxy can't keep up at high speedup)
+FS_GCS_ENABLE 0
+FS_THR_ENABLE 0
+
+# Scout cruises at ~1 m/s (mission data); SITL's default is much faster
+WP_SPEED 1.0
+CRUISE_SPEED 1.0

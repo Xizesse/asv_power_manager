@@ -1,0 +1,182 @@
+"""MAVLink bridge: the only part of the service that talks to the autopilot.
+
+- A background thread reads MAVLink and keeps `BoatState` up to date.
+- `snapshot()` gives the control loop a copy of the latest state.
+- `set_mode()`, `set_speed()`, `set_starlink()` send a command and wait for its ack.
+
+Run on its own to watch the state (prints every 5 s of autopilot time):
+    python3 service/bridge.py
+"""
+import argparse
+import queue
+import threading
+import time
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
+
+from pymavlink import mavutil
+
+AUTOPILOT_COMP = 1
+OWN_COMP = 191                # MAV_COMP_ID_ONBOARD_COMPUTER
+STARLINK_SERVO = 9
+STARLINK_ON_PWM, STARLINK_OFF_PWM = 1900, 1100
+STREAMS_HZ = {"SYSTEM_TIME": 1, "GLOBAL_POSITION_INT": 1, "VFR_HUD": 1, "SERVO_OUTPUT_RAW": 1,
+              "BATTERY_STATUS": 1}
+
+
+@dataclass
+class BoatState:
+    t_unix: float = 0.0          # autopilot time (GPS), seconds
+    mode: str = "?"
+    armed: bool = False
+    lat: float = 0.0
+    lon: float = 0.0
+    speed: float = 0.0           # m/s over ground
+    throttle_pwm: int = 0        # output 3
+    starlink_pwm: int = 0        # output 9
+    last_heartbeat: float = 0.0  # autopilot time of last heartbeat
+    # BATTERY_STATUS by id: 0 = battery (net, signed), 1 = total load, 2 = solar
+    batt_v: float = 0.0
+    batt_a: float = 0.0
+    load_v: float = 0.0
+    load_a: float = 0.0
+    solar_v: float = 0.0
+    solar_a: float = 0.0
+    batt_t: float = 0.0          # autopilot time of the last BATTERY_STATUS (0 = never)
+
+    def battery_fresh(self, max_age_s=30.0):
+        """True if battery data arrived recently (in autopilot time)."""
+        return self.batt_t > 0 and self.t_unix - self.batt_t <= max_age_s
+
+    @property
+    def throttle_pct(self):
+        """-100..100 %: 1500 us = stopped, 2000 = full ahead, 1000 = full astern."""
+        return (self.throttle_pwm - 1500) / 5 if self.throttle_pwm else 0.0
+
+    @property
+    def starlink_on(self):
+        return self.starlink_pwm > 1500
+
+    def line(self):
+        t = datetime.fromtimestamp(self.t_unix, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        return (f"{t}  {self.mode:<8} {'ARMED' if self.armed else 'disarmed':<8} "
+                f"{self.lat:.5f},{self.lon:.5f}  {self.speed:4.1f} m/s  "
+                f"thr={self.throttle_pct:+4.0f}%  starlink={'on' if self.starlink_on else 'off'}({self.starlink_pwm})  "
+                + (f"batt={self.batt_v:5.2f}V {self.batt_a:+5.1f}A  "
+                   f"load={self.load_v * self.load_a:5.1f}W  solar={self.solar_v * self.solar_a:5.1f}W"
+                   if self.battery_fresh() else "batt=NO DATA"))
+
+
+class Bridge:
+    def __init__(self, conn="udpin:127.0.0.1:14551"):
+        self.m = mavutil.mavlink_connection(conn, source_system=1, source_component=OWN_COMP)
+        self._state = BoatState()
+        self._lock = threading.Lock()
+        self._acks = queue.Queue()
+
+    # ---------- lifecycle ----------
+    def start(self):
+        """Wait for the autopilot, ask for the messages we need, start the reader thread."""
+        print("bridge: waiting for autopilot heartbeat...")
+        while True:   # wait for the *autopilot's* heartbeat (ignore GCS, env sim, etc.)
+            hb = self.m.recv_match(type="HEARTBEAT", blocking=True)
+            if hb.get_srcComponent() == AUTOPILOT_COMP and hb.type != mavutil.mavlink.MAV_TYPE_GCS:
+                self.m.target_system, self.m.target_component = hb.get_srcSystem(), AUTOPILOT_COMP
+                break
+        print(f"bridge: connected to system {self.m.target_system}")
+        for name, hz in STREAMS_HZ.items():
+            msg_id = getattr(mavutil.mavlink, f"MAVLINK_MSG_ID_{name}")
+            self._command(mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, msg_id, 1e6 / hz, wait=False)
+        threading.Thread(target=self._reader, daemon=True).start()
+
+    def snapshot(self):
+        """Copy of the latest state (safe to use while the reader keeps updating)."""
+        with self._lock:
+            return replace(self._state)
+
+    # ---------- commands ----------
+    def set_mode(self, name):
+        mode_id = self.m.mode_mapping()[name.upper()]
+        return self._command(mavutil.mavlink.MAV_CMD_DO_SET_MODE,
+                             mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode_id)
+
+    def set_speed(self, m_s):
+        return self._command(mavutil.mavlink.MAV_CMD_DO_CHANGE_SPEED, 1, m_s, -1)  # 1 = ground speed
+
+    def set_starlink(self, on):
+        pwm = STARLINK_ON_PWM if on else STARLINK_OFF_PWM
+        return self._command(mavutil.mavlink.MAV_CMD_DO_SET_SERVO, STARLINK_SERVO, pwm)
+
+    # ---------- internals ----------
+    def _command(self, cmd, p1=0, p2=0, p3=0, p4=0, wait=True, timeout=3.0):
+        """Send COMMAND_LONG; return True if the autopilot accepted it."""
+        while not self._acks.empty():          # drop stale acks
+            self._acks.get_nowait()
+        self.m.mav.command_long_send(self.m.target_system, AUTOPILOT_COMP, cmd, 0,
+                                     p1, p2, p3, p4, 0, 0, 0)
+        if not wait:
+            return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                ack = self._acks.get(timeout=deadline - time.monotonic())
+            except queue.Empty:
+                break
+            if ack.command == cmd:
+                return ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED
+        return False
+
+    def _reader(self):
+        while True:
+            msg = self.m.recv_match(blocking=True, timeout=1.0)
+            if msg is None:
+                continue
+            t = msg.get_type()
+            if t == "BATTERY_STATUS":       # from the autopilot or the env sim (any component)
+                self._on_battery(msg)
+                continue
+            if msg.get_srcComponent() != AUTOPILOT_COMP:
+                continue
+            if t == "COMMAND_ACK":
+                self._acks.put(msg)
+                continue
+            with self._lock:
+                s = self._state
+                if t == "HEARTBEAT":
+                    s.mode = mavutil.mode_string_v10(msg)
+                    s.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+                    s.last_heartbeat = s.t_unix
+                elif t == "SYSTEM_TIME" and msg.time_unix_usec:
+                    s.t_unix = msg.time_unix_usec / 1e6
+                elif t == "GLOBAL_POSITION_INT":
+                    s.lat, s.lon = msg.lat / 1e7, msg.lon / 1e7
+                elif t == "VFR_HUD":
+                    s.speed = msg.groundspeed
+                elif t == "SERVO_OUTPUT_RAW":
+                    s.throttle_pwm = msg.servo3_raw
+                    s.starlink_pwm = getattr(msg, "servo9_raw", 0)
+
+
+    def _on_battery(self, msg):
+        volts = msg.voltages[0] / 1000 if msg.voltages[0] not in (0, 65535) else 0.0
+        amps = msg.current_battery / 100 if msg.current_battery != -1 else 0.0
+        with self._lock:
+            s = self._state
+            s.batt_t = s.t_unix
+            if msg.id == 0:
+                s.batt_v, s.batt_a = volts, amps
+            elif msg.id == 1:
+                s.load_v, s.load_a = volts, amps
+            elif msg.id == 2:
+                s.solar_v, s.solar_a = volts, amps
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--conn", default="udpin:127.0.0.1:14551")
+    a = ap.parse_args()
+    b = Bridge(a.conn)
+    b.start()
+    while True:
+        print(b.snapshot().line())
+        time.sleep(5)

@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+claude/
+data/
+data/
+sim/sitl_run/
+sim/logs/
+shore/data/
+claude/
+.venv/

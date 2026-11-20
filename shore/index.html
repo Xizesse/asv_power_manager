@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Scout — shore view</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 24px; color: #222; background: #fafafa; }
+  h1 { margin: 0 0 4px; font-size: 22px; }
+  #status { margin-bottom: 16px; font-size: 14px; color: #555; }
+  #status b.ok { color: #1a7f37; } #status b.stale { color: #b42318; }
+  .card { background: #fff; border: 1px solid #e3e3e3; border-radius: 8px; padding: 8px; margin-bottom: 16px; }
+  .plot { height: 320px; }
+</style>
+</head>
+<body>
+<h1>Scout — shore view</h1>
+<div id="status">Waiting for data…</div>
+<div class="card"><div id="volt" class="plot"></div></div>
+<div class="card"><div id="power" class="plot"></div></div>
+
+<script>
+const STALE_AFTER_S = 30;   // wall-clock seconds without contact before we call the link stale
+const GAP_FACTOR = 3;       // a jump in boat time > 3x the usual record spacing = missing data
+
+// Missing data must never be drawn as 0 or bridged by a straight line:
+// null values stay null, and a null point is inserted wherever records are missing.
+function withGaps(records, key) {
+  const dts = [];
+  for (let i = 1; i < records.length; i++) dts.push(records[i].t - records[i - 1].t);
+  const sorted = dts.slice().sort((a, b) => a - b);
+  const typical = sorted.length ? sorted[Math.floor(sorted.length / 2)] : 0;
+  const x = [], y = [];
+  records.forEach((r, i) => {
+    if (i > 0 && typical > 0 && r.t - records[i - 1].t > GAP_FACTOR * typical) {
+      x.push(new Date((records[i - 1].t + typical) * 1000)); y.push(null);
+    }
+    x.push(new Date(r.t * 1000));
+    y.push(r[key] === undefined ? null : r[key]);
+  });
+  return { x, y };
+}
+
+function fmt(t) { return new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC"; }
+
+async function refresh() {
+  let data;
+  try {
+    data = await (await fetch("/api/telemetry")).json();
+  } catch (e) {
+    document.getElementById("status").textContent = "Shore server not reachable.";
+    return;
+  }
+  const r = data.records;
+  if (!r.length) return;
+
+  const last = r[r.length - 1];
+  const ago = data.last_contact ? (Date.now() / 1000 - data.last_contact) : Infinity;
+  const linkTxt = ago < STALE_AFTER_S
+    ? `<b class="ok">link up</b> (last contact ${ago.toFixed(0)} s ago)`
+    : `<b class="stale">link stale</b> (last contact ${isFinite(ago) ? ago.toFixed(0) + " s ago" : "never"})`;
+  const lastV = [...r].reverse().find(x => x.batt_v != null);
+  document.getElementById("status").innerHTML =
+    `${linkTxt} · boat time ${fmt(last.t)} · ${last.mode} · ` +
+    `${lastV ? lastV.batt_v.toFixed(2) + " V" : "no battery data"} · ` +
+    `Starlink ${last.starlink ? "on" : "off"} · ${r.length} records`;
+
+  const layout = (title, ytitle) => ({
+    title: { text: title, font: { size: 15 } }, margin: { t: 40, r: 20, b: 40, l: 55 },
+    xaxis: { title: "boat time (UTC)" }, yaxis: { title: ytitle }, legend: { orientation: "h" },
+  });
+  Plotly.react("volt", [
+    { ...withGaps(r, "batt_v"), name: "Battery voltage (actual)", mode: "lines", line: { color: "#222" }, connectgaps: false },
+  ], layout("Battery voltage", "V"));
+  Plotly.react("power", [
+    { ...withGaps(r, "solar_w"), name: "Solar", mode: "lines", line: { color: "#e8a317" }, connectgaps: false },
+    { ...withGaps(r, "load_w"), name: "Load", mode: "lines", line: { color: "#2f6fb0" }, connectgaps: false },
+  ], layout("Power", "W"));
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
