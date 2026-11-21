@@ -15,3 +15,7 @@ FS_THR_ENABLE 0
 # Scout cruises at ~1 m/s (mission data); SITL's default is much faster
 WP_SPEED 1.0
 CRUISE_SPEED 1.0
+
+# Water current ("tide"): the motorboat frame defaults to 0.5 m/s from the north. Off for now, so the
+# planner's motor model (speed through water) matches the sim. Wind and waves keep their defaults.
+SIM_TIDE_SPEED 0

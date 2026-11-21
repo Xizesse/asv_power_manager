@@ -1,14 +1,20 @@
-"""Control loop, step 2: plan once on start, then read the boat state on every tick, log it, send it to shore.
+"""Control loop, step 3: plan once on start, start the mission, then follow the plan on every tick.
 
 On start:
   1. wait for a usable boat state (autopilot time, fresh battery voltage, position)
   2. run the planner from that state (planner.make_plan)
   3. save the plan to service/state/plan.json and queue it for shore
+  4. upload the mission waypoints to the autopilot, switch to AUTO, arm
+
+On every tick:
+  - set the autopilot speed to the plan's speed for the current hour (HOLD if the plan says 0)
+  - switch Starlink on/off according to the mission schedule
+  - log the state and send it to shore
 
 TEMPORARY: the mission is read from planner/mission.json and the forecast from
 data/weather/forecast.csv. Both should arrive from shore (mission upload / forecast pack).
 
-The plan is NOT applied yet (no speed / Starlink / mission commands to the autopilot).
+Without a plan (--no-plan, or the planner failed) the boat runs at the mission's speed_ms.
 
 Ticks run on *autopilot* time, so they speed up with SIM_SPEEDUP.
 
@@ -20,6 +26,7 @@ import argparse
 import json
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import planner
@@ -30,18 +37,19 @@ ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / "service" / "state"
 
 
-def run(bridge, shore, tick_s):
+def run(bridge, shore, pilot, tick_s):
     next_tick = 0.0
     while True:
         state = bridge.snapshot()
         if state.t_unix and state.t_unix >= next_tick:
-            on_tick(state, shore)
+            on_tick(state, shore, pilot)
             next_tick = state.t_unix + tick_s
         time.sleep(0.05)   # small wall-clock nap; the tick itself is autopilot time
 
 
-def on_tick(state, shore):
-    """One control step. For now: log what we see and report it to shore."""
+def on_tick(state, shore, pilot):
+    """One control step: apply the plan's setpoints, log what we see, report it to shore."""
+    pilot.apply(state)
     print(state.line())
     fresh = state.battery_fresh()          # no recent battery message -> send null, never a fake 0
     shore.send({
@@ -57,6 +65,69 @@ def on_tick(state, shore):
         "load_w": round(state.load_v * state.load_a, 1) if fresh else None,
         "solar_w": round(state.solar_v * state.solar_a, 1) if fresh else None,
     })
+
+
+# ---------- autopilot ----------
+def start_mission(bridge, mission):
+    """Upload the mission waypoints, switch to AUTO and arm. Return True if all three were accepted."""
+    s = bridge.snapshot()
+    if s.mode == "AUTO":       # each item written to a running AUTO mission restarts it -> leave AUTO first
+        bridge.set_mode("MANUAL")
+    home = {"lat": s.lat, "lon": s.lon}
+    ok = bridge.upload_mission(mission["waypoints"], home)
+    print(f"autopilot: mission upload ({len(mission['waypoints'])} waypoints) -> {'ok' if ok else 'FAILED'}")
+    if not ok:
+        return False
+    ok_mode = bridge.set_mode("AUTO")
+    ok_arm = bridge.arm()
+    print(f"autopilot: AUTO -> {'ok' if ok_mode else 'FAILED'}, arm -> {'ok' if ok_arm else 'FAILED'}")
+    return ok_mode and ok_arm
+
+
+class Pilot:
+    """Turns the plan (or the mission, without a plan) into autopilot setpoints.
+
+    Speed comes from plan["hourly"] (the entry for the current hour; the last one after the plan ends).
+    Starlink follows the mission schedule (planner.starlink_on).
+    Every tick the boat is kept armed and in AUTO (re-armed / re-switched if not; this also retries a
+    start that failed, e.g. EKF not ready yet). For now that includes overriding a deliberate disarm.
+    Speed is re-sent when it changes, after a mode change, or if the last command was refused; Starlink
+    is compared with the measured relay output, so a missed command is retried on the next tick."""
+
+    def __init__(self, bridge, mission, plan=None):
+        self.bridge = bridge
+        self.mission = mission
+        self.plan = plan
+        self.speed_cmd = None          # last speed the autopilot accepted
+
+    def setpoints(self, t_unix):
+        """-> (speed m/s, starlink on?) wanted at autopilot time t_unix."""
+        if self.plan and self.plan["hourly"]:
+            past = [h["speed"] for h in self.plan["hourly"] if h["t"] <= t_unix]
+            speed = past[-1] if past else self.plan["hourly"][0]["speed"]
+        else:
+            speed = self.mission["speed_ms"]
+        now = datetime.fromtimestamp(t_unix, timezone.utc)
+        return float(speed), bool(planner.starlink_on(now, self.mission["starlink"]))
+
+    def apply(self, state):
+        speed, starlink = self.setpoints(state.t_unix)
+        # Rover refuses DO_CHANGE_SPEED 0, so "stop" = HOLD; any other speed = AUTO at that speed
+        want_mode = "HOLD" if speed <= 0 else "AUTO"
+        if state.mode != want_mode:
+            ok = self.bridge.set_mode(want_mode)
+            print(f"autopilot: mode {state.mode} -> {want_mode} {'ok' if ok else 'REFUSED'}")
+            self.speed_cmd = None      # entering AUTO resets the speed to WP_SPEED -> send ours again
+        if not state.armed:
+            ok = self.bridge.arm()
+            print(f"autopilot: arm {'ok' if ok else 'REFUSED'}")
+        if speed > 0 and speed != self.speed_cmd:
+            ok = self.bridge.set_speed(speed)
+            print(f"autopilot: speed -> {speed} m/s {'ok' if ok else 'REFUSED'}")
+            self.speed_cmd = speed if ok else None
+        if starlink != state.starlink_on:
+            ok = self.bridge.set_starlink(starlink)
+            print(f"autopilot: starlink -> {'on' if starlink else 'off'} {'ok' if ok else 'REFUSED'}")
 
 
 # ---------- planning ----------
@@ -79,13 +150,12 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
-def plan_on_start(bridge, shore, mission_path, forecast_path):
+def plan_on_start(bridge, shore, mission, forecast_path):
     print("planner: waiting for time, battery voltage and position...")
     s = wait_for_plannable_state(bridge)
     if s is None:
         print("planner: no usable state after 120 s -> running without a plan")
         return None
-    mission = json.loads(Path(mission_path).read_text())
     forecast = planner.read_forecast(forecast_path)
     tic = time.monotonic()
     try:
@@ -113,13 +183,31 @@ def main():
     ap.add_argument("--no-plan", action="store_true", help="skip planning on start")
     a = ap.parse_args()
 
+    mission = json.loads(Path(a.mission).read_text())
+
+    # Bridge = our only MAVLink connection to the autopilot. start() blocks until the autopilot's
+    # heartbeat arrives, asks it to stream the messages we need, and starts the reader thread
+    # that keeps bridge.snapshot() up to date.
     bridge = Bridge(a.conn)
     bridge.start()
+
+    # ShoreLink = store-and-forward to the shore server. start() launches the background thread that
+    # POSTs queued telemetry (and the latest plan) whenever shore is reachable; it never blocks us.
     shore = ShoreLink(a.shore)
     shore.start()
-    if not a.no_plan:
-        plan_on_start(bridge, shore, a.mission, a.forecast)
-    run(bridge, shore, a.tick)
+
+    # Plan once from the current state (time, battery V, position). None if skipped or it failed.
+    plan = None if a.no_plan else plan_on_start(bridge, shore, mission, a.forecast)
+
+    # Wait for GPS fix, EKF position, home and pre-arm checks (BoatState.not_ready()), then give the
+    # autopilot the route, switch to AUTO and arm: from here on the boat is moving. If something
+    # fails here, Pilot retries AUTO + arm on every tick.
+    bridge.wait_until_ready()
+    start_mission(bridge, mission)
+
+    # Pilot = turns the plan into speed / Starlink commands; run() calls it on every tick.
+    pilot = Pilot(bridge, mission, plan)
+    run(bridge, shore, pilot, a.tick)
 
 
 if __name__ == "__main__":

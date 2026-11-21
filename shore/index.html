@@ -9,6 +9,9 @@
   h1 { margin: 0 0 4px; font-size: 22px; }
   #top { display: flex; align-items: center; justify-content: space-between; }
   #reset { font-size: 13px; padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; }
+  #zoom { font-size: 13px; padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; margin-right: 8px; }
+  #zoom:hover { background: #eef4fb; border-color: #2f6fb0; color: #2f6fb0; }
+  #zoom.on { background: #2f6fb0; border-color: #2f6fb0; color: #fff; }
   #reset:hover { background: #fdecec; border-color: #b42318; color: #b42318; }
   #status { margin-bottom: 16px; font-size: 14px; color: #555; }
   #plan { margin-bottom: 16px; font-size: 14px; color: #555; }
@@ -26,7 +29,10 @@
 <body>
 <div id="top">
   <h1>Scout — shore view</h1>
+  <div>
+  <button id="zoom" title="Toggle between the whole mission and the last hour around the latest record">Zoom: last hour</button>
   <button id="reset" title="Archive the telemetry on shore and start fresh (the plan is kept)">Reset data</button>
+  </div>
 </div>
 <div id="status">Waiting for data…</div>
 <div id="plan">No plan received yet.</div>
@@ -40,6 +46,22 @@
 <script>
 const STALE_AFTER_S = 30;   // wall-clock seconds without contact before we call the link stale
 const GAP_FACTOR = 3;       // a jump in boat time > 3x the usual record spacing = missing data
+const ZOOM_BEFORE_S = 45 * 60;  // zoomed view: 45 min before the latest record...
+const ZOOM_AFTER_S = 15 * 60;   // ...and 15 min after it, so the plan just ahead is visible
+let zoomed = false;
+
+// y range of everything drawn inside [x0, x1] (Plotly would otherwise autoscale y on the full series)
+function yRange(traces, x0, x1) {
+  let lo = Infinity, hi = -Infinity;
+  traces.forEach(tr => tr.x.forEach((x, i) => {
+    const y = tr.y[i];
+    if (y == null || x < x0 || x > x1) return;
+    lo = Math.min(lo, y); hi = Math.max(hi, y);
+  }));
+  if (!isFinite(lo)) return null;
+  const pad = (hi - lo) * 0.08 || Math.abs(hi) * 0.05 || 1;
+  return [lo - pad, hi + pad];
+}
 
 // Missing data must never be drawn as 0 or bridged by a straight line:
 // null values stay null, and a null point is inserted wherever records are missing.
@@ -100,10 +122,19 @@ async function refresh() {
     `Starlink ${last.starlink ? "on" : "off"} · ${r.length} records`;
   }
 
-  const layout = (title, ytitle) => ({
-    title: { text: title, font: { size: 15 } }, margin: { t: 40, r: 20, b: 40, l: 55 },
-    xaxis: { title: "boat time (UTC)" }, yaxis: { title: ytitle }, legend: { orientation: "h" },
-  });
+  const tNow = r.length ? r[r.length - 1].t : null;
+  const zoomOn = zoomed && tNow != null;
+  const x0 = zoomOn ? utc(tNow - ZOOM_BEFORE_S) : null, x1 = zoomOn ? utc(tNow + ZOOM_AFTER_S) : null;
+  const layout = (title, ytitle, traces) => {
+    const xaxis = { title: "boat time (UTC)" }, yaxis = { title: ytitle };
+    if (zoomOn) {
+      xaxis.range = [x0, x1];
+      const yr = yRange(traces, x0, x1);
+      if (yr) yaxis.range = yr;
+    }
+    return { title: { text: title, font: { size: 15 } }, margin: { t: 40, r: 20, b: 40, l: 55 },
+             xaxis, yaxis, legend: { orientation: "h" } };
+  };
   const voltTraces = [
     { ...withGaps(r, "batt_v"), name: "Battery voltage (actual)", mode: "lines", line: { color: "#222" }, connectgaps: false },
   ];
@@ -115,7 +146,7 @@ async function refresh() {
       { x: [px[0], px[px.length - 1]], y: [plan.reserve_v, plan.reserve_v], name: `Reserve ${plan.reserve_v} V`,
         mode: "lines", line: { color: "#b42318", width: 1, dash: "dot" } });
   }
-  Plotly.react("volt", voltTraces, layout("Battery voltage: actual vs plan", "V"), CFG);
+  Plotly.react("volt", voltTraces, layout("Battery voltage: actual vs plan", "V", voltTraces), CFG);
   const powerTraces = [
     { ...withGaps(r, "solar_w"), name: "Solar (actual)", mode: "lines", line: { color: "#e8a317" }, connectgaps: false },
     { ...withGaps(r, "load_w"), name: "Load (actual)", mode: "lines", line: { color: "#2f6fb0" }, connectgaps: false },
@@ -128,7 +159,7 @@ async function refresh() {
       { x: px, y: plan.series.load_w, name: "Load (planned)", mode: "lines",
         line: { color: "#2f6fb0", dash: "dot", width: 1.5 }, opacity: 0.8 });
   }
-  Plotly.react("power", powerTraces, layout("Power: actual vs plan", "W"), CFG);
+  Plotly.react("power", powerTraces, layout("Power: actual vs plan", "W", powerTraces), CFG);
 
   const speedTraces = [
     { ...withGaps(r, "speed"), name: "Speed (actual, GPS)", mode: "lines", line: { color: "#2b8a3e" }, connectgaps: false },
@@ -137,7 +168,7 @@ async function refresh() {
     speedTraces.push({ x: plan.series.t.map(utc), y: plan.series.speed, name: "Speed (planned)", mode: "lines",
                        line: { color: "#2b8a3e", dash: "dot", width: 1.5, shape: "hv" }, opacity: 0.8 });
   }
-  Plotly.react("speed", speedTraces, layout("Speed: actual vs plan", "m/s"), CFG);
+  Plotly.react("speed", speedTraces, layout("Speed: actual vs plan", "m/s", speedTraces), CFG);
 }
 
 document.getElementById("reset").addEventListener("click", async () => {
@@ -150,6 +181,14 @@ document.getElementById("reset").addEventListener("click", async () => {
   }
   ["volt", "power", "speed"].forEach(id => Plotly.purge(id));
   document.getElementById("status").textContent = "Data cleared. Waiting for data…";
+  refresh();
+});
+
+document.getElementById("zoom").addEventListener("click", () => {
+  zoomed = !zoomed;
+  const b = document.getElementById("zoom");
+  b.classList.toggle("on", zoomed);
+  b.textContent = zoomed ? "Full view" : "Zoom: last hour";
   refresh();
 });
 
