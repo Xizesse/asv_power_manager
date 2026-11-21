@@ -24,7 +24,8 @@ STARLINK_ON_PWM, STARLINK_OFF_PWM = 1900, 1100
 STREAMS_HZ = {"SYSTEM_TIME": 1, "GLOBAL_POSITION_INT": 1, "VFR_HUD": 1, "SERVO_OUTPUT_RAW": 1,
               "BATTERY_STATUS": 1,
               # readiness: GPS fix, EKF health, pre-arm checks, home
-              "GPS_RAW_INT": 1, "EKF_STATUS_REPORT": 1, "SYS_STATUS": 1, "HOME_POSITION": 0.2}
+              "GPS_RAW_INT": 1, "EKF_STATUS_REPORT": 1, "SYS_STATUS": 1, "HOME_POSITION": 0.2,
+              "MISSION_CURRENT": 1}   # MISSION_ITEM_REACHED is sent by the autopilot on its own
 # EKF must have all of these before the autopilot can navigate (and arm)
 EKF_NEEDED = {"attitude": "EKF_ATTITUDE", "horizontal velocity": "EKF_VELOCITY_HORIZ",
               "absolute position": "EKF_POS_HORIZ_ABS", "predicted position": "EKF_PRED_POS_HORIZ_ABS"}
@@ -61,6 +62,9 @@ class BoatState:
     ekf_flags: int = 0           # EKF_STATUS_REPORT.flags
     prearm_ok: bool = False      # SYS_STATUS: autopilot's own pre-arm checks pass
     home_set: bool = False       # HOME_POSITION received
+    # mission progress
+    mission_seq: int = -1        # MISSION_CURRENT.seq: item the autopilot is heading to (-1 = unknown)
+    reached_seq: int = -1        # MISSION_ITEM_REACHED.seq: last item reached since we connected
 
     def not_ready(self):
         """What is still missing before we can upload a mission, go AUTO and arm ([] = ready)."""
@@ -167,6 +171,10 @@ class Bridge:
 
     def arm(self, on=True):
         return self._command(mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 1 if on else 0)
+
+    def set_mission_current(self, seq):
+        """Make mission item `seq` the next one. While not in AUTO, AUTO will resume from it (MIS_RESTART 0)."""
+        return self._command(mavutil.mavlink.MAV_CMD_DO_SET_MISSION_CURRENT, seq, 0)
 
     def upload_mission(self, waypoints, home, timeout=10.0):
         """Replace the autopilot mission with `waypoints` ([{lat, lon}, ...]). Return True if accepted.
@@ -291,6 +299,10 @@ class Bridge:
                                        & mavutil.mavlink.MAV_SYS_STATUS_PREARM_CHECK)
                 elif t == "HOME_POSITION":
                     s.home_set = True
+                elif t == "MISSION_CURRENT":
+                    s.mission_seq = msg.seq
+                elif t == "MISSION_ITEM_REACHED":
+                    s.reached_seq = msg.seq
 
 
     def _on_battery(self, msg):

@@ -1,10 +1,12 @@
 """Control loop, step 3: plan once on start, start the mission, then follow the plan on every tick.
 
-On start:
+On start (the same path after a crash/restart of the service or the autopilot):
+  0. load mission progress (service/state/progress.json): which waypoints are already done
   1. wait for a usable boat state (autopilot time, fresh battery voltage, position)
-  2. run the planner from that state (planner.make_plan)
+  2. run the planner from that state, over the waypoints NOT yet reached (planner.make_plan)
   3. save the plan to service/state/plan.json and queue it for shore
-  4. upload the mission waypoints to the autopilot, switch to AUTO, arm
+  4. upload the full mission, set the autopilot's current item to the next unreached waypoint,
+     switch to AUTO, arm. All waypoints done -> HOLD, no mission start.
 
 On every tick:
   - set the autopilot speed to the plan's speed for the current hour (HOLD if the plan says 0)
@@ -23,6 +25,7 @@ Ticks run on *autopilot* time, so they speed up with SIM_SPEEDUP.
 Run (SITL + env sim running; shore server optional):
     python3 service/control_loop.py
     python3 service/control_loop.py --tick 60
+    python3 service/control_loop.py --fresh     # mission again from waypoint 0 (default: continue)
 """
 import argparse
 import json
@@ -34,19 +37,22 @@ from pathlib import Path
 import planner
 from bridge import Bridge
 from minute_bins import MinuteBins
+from progress import Progress
 from shore_link import ShoreLink
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE_DIR = ROOT / "service" / "state"
 
 
-def run(bridge, shore, pilot, tick_s):
+def run(bridge, shore, pilot, progress, tick_s):
     """Two clocks, both autopilot time: telemetry = 1-minute averages (same bins as the plan series),
-    control = every tick_s."""
+    control = every tick_s. Waypoint progress is checked on every loop (saved when it moves)."""
     bins = MinuteBins()
     next_tick = 0.0
     while True:
         state = bridge.snapshot()
+        if state.reached_seq >= 0:
+            progress.on_reached(state.reached_seq, state.t_unix)
         record = bins.add(state)
         if record is not None:
             shore.send(record)
@@ -63,14 +69,28 @@ def on_tick(state, pilot):
 
 
 # ---------- autopilot ----------
-def start_mission(bridge, mission):
-    """Upload the mission waypoints, switch to AUTO and arm. Return True if all three were accepted."""
+def start_mission(bridge, mission, progress):
+    """Upload the full mission, continue from the next unreached waypoint, switch to AUTO and arm.
+    Return True if all steps were accepted.
+
+    Always uploads (a few items, < 1 s) instead of trusting what the autopilot holds: simpler, and the
+    autopilot's mission is then known to be ours. The current item must be set again anyway, because
+    ArduPilot resets to the first waypoint on reboot (AP_Mission::init -> reset)."""
+    if progress.done:
+        ok = bridge.set_mode("HOLD")
+        print(f"autopilot: all {progress.n_wp} waypoints already reached -> HOLD {'ok' if ok else 'REFUSED'}")
+        return False
     s = bridge.snapshot()
     if s.mode == "AUTO":       # each item written to a running AUTO mission restarts it -> leave AUTO first
         bridge.set_mode("MANUAL")
     home = {"lat": s.lat, "lon": s.lon}
     ok = bridge.upload_mission(mission["waypoints"], home)
     print(f"autopilot: mission upload ({len(mission['waypoints'])} waypoints) -> {'ok' if ok else 'FAILED'}")
+    if not ok:
+        return False
+    seq = progress.next_wp + 1                 # seq 0 = home
+    ok = bridge.set_mission_current(seq)
+    print(f"autopilot: continue from waypoint {progress.next_wp} (seq {seq}) -> {'ok' if ok else 'FAILED'}")
     if not ok:
         return False
     ok_mode = bridge.set_mode("AUTO")
@@ -89,15 +109,18 @@ class Pilot:
     Speed is re-sent when it changes, after a mode change, or if the last command was refused; Starlink
     is compared with the measured relay output, so a missed command is retried on the next tick."""
 
-    def __init__(self, bridge, mission, plan=None):
+    def __init__(self, bridge, mission, progress, plan=None):
         self.bridge = bridge
         self.mission = mission
+        self.progress = progress
         self.plan = plan
         self.speed_cmd = None          # last speed the autopilot accepted
 
     def setpoints(self, t_unix):
-        """-> (speed m/s, starlink on?) wanted at autopilot time t_unix."""
-        if self.plan and self.plan["hourly"]:
+        """-> (speed m/s, starlink on?) wanted at autopilot time t_unix. Speed 0 once all waypoints are done."""
+        if self.progress.done:
+            speed = 0.0
+        elif self.plan and self.plan["hourly"]:
             past = [h["speed"] for h in self.plan["hourly"] if h["t"] <= t_unix]
             speed = past[-1] if past else self.plan["hourly"][0]["speed"]
         else:
@@ -106,6 +129,19 @@ class Pilot:
         return float(speed), bool(planner.starlink_on(now, self.mission["starlink"]))
 
     def apply(self, state):
+        # 1. vehicle not ready (e.g. autopilot just rebooted, EKF/GPS starting) -> touch nothing, wait
+        missing = state.not_ready()
+        if missing:
+            print("pilot: waiting for: " + "; ".join(missing))
+            return
+        # 2. autopilot behind our progress (it reset to the first waypoint after a reboot) -> start again
+        #    from the next unreached waypoint (upload, set current, AUTO, arm)
+        expected = self.progress.next_wp + 1           # seq 0 = home
+        if not self.progress.done and 0 <= state.mission_seq < expected:
+            print(f"pilot: autopilot at mission item {state.mission_seq}, expected {expected} -> restarting mission")
+            start_mission(self.bridge, self.mission, self.progress)
+            self.speed_cmd = None                      # entering AUTO resets the speed -> send ours again
+            return
         speed, starlink = self.setpoints(state.t_unix)
         # Rover refuses DO_CHANGE_SPEED 0, so "stop" = HOLD; any other speed = AUTO at that speed
         want_mode = "HOLD" if speed <= 0 else "AUTO"
@@ -145,8 +181,14 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
-def plan_on_start(bridge, shore, mission, forecast_path):
-    print("planner: waiting for time, battery voltage and position...")
+def plan_on_start(bridge, shore, mission, progress, forecast_path):
+    """Plan from the current state over the waypoints not reached yet (after a restart: a replan)."""
+    if progress.done:
+        print("planner: all waypoints reached -> no plan")
+        return None
+    remaining = dict(mission, waypoints=mission["waypoints"][progress.next_wp:])
+    print(f"planner: {len(remaining['waypoints'])}/{progress.n_wp} waypoints left "
+          f"(from waypoint {progress.next_wp}); waiting for time, battery voltage and position...")
     s = wait_for_plannable_state(bridge)
     if s is None:
         print("planner: no usable state after 120 s -> running without a plan")
@@ -154,7 +196,7 @@ def plan_on_start(bridge, shore, mission, forecast_path):
     forecast = planner.read_forecast(forecast_path)
     tic = time.monotonic()
     try:
-        plan = planner.make_plan(mission, forecast, s.t_unix, s.batt_v, s.lat, s.lon)
+        plan = planner.make_plan(remaining, forecast, s.t_unix, s.batt_v, s.lat, s.lon)
     except ValueError as e:                # e.g. deadline already passed, outside the forecast
         print(f"planner: cannot plan ({e}) -> running without a plan")
         return None
@@ -176,9 +218,14 @@ def main():
     ap.add_argument("--forecast", default=str(ROOT / "data" / "weather" / "forecast.csv"),
                     help="TEMPORARY: local forecast")
     ap.add_argument("--no-plan", action="store_true", help="skip planning on start")
+    ap.add_argument("--fresh", action="store_true",
+                    help="start the mission again from waypoint 0 (forget service/state/progress.json)")
     a = ap.parse_args()
 
     mission = json.loads(Path(a.mission).read_text())
+    # Which waypoints are already done (service/state/progress.json). After a restart the plan covers
+    # only the rest, and the autopilot continues from the next unreached waypoint.
+    progress = Progress(STATE_DIR / "progress.json", mission, fresh=a.fresh)
 
     # Bridge = our only MAVLink connection to the autopilot. start() blocks until the autopilot's
     # heartbeat arrives, asks it to stream the messages we need, and starts the reader thread
@@ -192,17 +239,17 @@ def main():
     shore.start()
 
     # Plan once from the current state (time, battery V, position). None if skipped or it failed.
-    plan = None if a.no_plan else plan_on_start(bridge, shore, mission, a.forecast)
+    plan = None if a.no_plan else plan_on_start(bridge, shore, mission, progress, a.forecast)
 
     # Wait for GPS fix, EKF position, home and pre-arm checks (BoatState.not_ready()), then give the
     # autopilot the route, switch to AUTO and arm: from here on the boat is moving. If something
     # fails here, Pilot retries AUTO + arm on every tick.
     bridge.wait_until_ready()
-    start_mission(bridge, mission)
+    start_mission(bridge, mission, progress)
 
     # Pilot = turns the plan into speed / Starlink commands; run() calls it on every tick.
-    pilot = Pilot(bridge, mission, plan)
-    run(bridge, shore, pilot, a.tick)
+    pilot = Pilot(bridge, mission, progress, plan)
+    run(bridge, shore, pilot, progress, a.tick)
 
 
 if __name__ == "__main__":

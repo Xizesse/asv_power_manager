@@ -11,6 +11,7 @@
     "at_min": 10,
     "on_min": 5
   },
+  
   "waypoints": [
     {
       "lat": 60.501797,
