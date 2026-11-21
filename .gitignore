@@ -11,3 +11,4 @@ shore/data/
 claude/
 .venv/
 service/state/
+sim/state/
