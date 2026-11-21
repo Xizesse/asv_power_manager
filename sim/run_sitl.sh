@@ -10,7 +10,7 @@ set -euo pipefail
 LAT=60.5
 LON=1.5
 START="2025-07-14T11:00:00Z"
-SPEEDUP=${SPEEDUP:-1}   # target only; this laptop achieved ~20x
+SPEEDUP=${SPEEDUP:-10}   # target only; this laptop achieved ~20x
 
 SIM_DIR="$(cd "$(dirname "$0")" && pwd)"
 RUN_DIR="$SIM_DIR/sitl_run"          # eeprom, logs, mav.tlog live here (gitignore it)

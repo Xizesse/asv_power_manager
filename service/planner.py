@@ -29,7 +29,8 @@ V_CAP = 25.0
 V_EMPTY = 20.0
 
 SPEEDS = np.round(np.arange(0, 1.5 + 1e-9, 0.2), 1)   # 0.0 ... 1.4 m/s
-SERIES_EVERY_MIN = 5                                    # resolution of the predicted curve sent to shore
+SERIES_EVERY_MIN = 1                                    # resolution of the predicted curve sent to shore
+                                                        # (same 1-min bins as the telemetry, service/minute_bins.py)
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -248,8 +249,8 @@ def make_plan(mission, forecast, now_unix, batt_v, lat, lon):
     speeds = [float(v) for v in planner.solve(problem)]
     df, s = problem.evaluate(speeds)
 
-    # V, speed: value at the start of each bin. Power: mean over the bin (sampling every Nth minute would
-    # hit or miss the short Starlink bursts at random; the mean keeps the energy right).
+    # V, speed: value at the start of each bin. Power: mean over the bin (with 1-min bins = the minute itself;
+    # with longer bins the mean keeps the energy right instead of hitting or missing Starlink bursts).
     bins = df.resample(f"{SERIES_EVERY_MIN}min", origin="start")
     series = bins.first()
     series[["P_solar", "P_load"]] = bins[["P_solar", "P_load"]].mean()
@@ -277,7 +278,7 @@ def make_plan(mission, forecast, now_unix, batt_v, lat, lon):
             "t": t_unix,
             "v_batt": [round(x, 3) for x in series.V],
             "speed": [round(x, 2) for x in series.v],
-            "solar_w": [round(x, 1) for x in series.P_solar],     # 5-min means
-            "load_w": [round(x, 1) for x in series.P_load],       # 5-min means
+            "solar_w": [round(x, 1) for x in series.P_solar],     # 1-min means
+            "load_w": [round(x, 1) for x in series.P_load],       # 1-min means
         },
     }

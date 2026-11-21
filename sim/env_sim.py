@@ -5,7 +5,7 @@ Pretends to be Scout's power-monitoring board, a separate MAVLink component
 ArduPilot forwards its messages to its other ports, so the service and QGC see them.
 
   reads from SITL : SYSTEM_TIME (scenario clock), SERVO_OUTPUT_RAW (throttle, Starlink on output 9),
-                    VFR_HUD (speed)
+                    VFR_HUD (speed), HEARTBEAT (armed, mode)
   reads from disk : data/weather/truth.csv (ERA5, hourly)  <- the env sim is the ONLY reader of the truth
   sends           : HEARTBEAT (type BATTERY) every 1 s wall time
                     BATTERY_STATUS id 0/1/2 every 1 s of autopilot time
@@ -33,8 +33,10 @@ from pymavlink import mavutil
 SOLAR_K_M2 = 0.164          # P_solar = k * G, effective area eta*A (nb 04 Part 4)
 HOTEL_W = 10.0              # base load (nb 03)
 STARLINK_W = 22.0           # extra while Starlink is on (nb 03)
-PROP_W_PER_MS = 64.8        # propulsion = k * v when the motor is on (nb 03 k*v fit, best of v/v2/v3)
-MOTOR_ON_THROTTLE_PCT = 2.0 # below this the motor counts as off
+PROP_W_PER_MS = 64.8        # propulsion = k * v when the motor is driving (nb 03 k*v fit, best of v/v2/v3)
+# Motor counts as driving when armed and not in HOLD. Not a throttle threshold: SITL's motorboat
+# holds ~0.6 m/s at <0.5 % throttle, so a throttle gate dropped the propulsion load entirely.
+ROVER_MODE_HOLD = 4
 # battery: nb 05 Model B1 (best free run with measured inputs; used by nb 06), copied 20 Nov
 BATT_K_WH_PER_V = 420.3     # Wh per volt of open-circuit voltage
 BATT_ETA = 1.138            # solar -> battery factor (fitted; >1 is unphysical, see nb 05 notes)
@@ -104,6 +106,8 @@ class EnvSim:
         self.throttle_pwm = 0
         self.starlink_pwm = 0
         self.speed = 0.0
+        self.armed = False
+        self.mode = None
         self.last_step_t = None
         self.out = {}
         log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +144,9 @@ class EnvSim:
             self.starlink_pwm = getattr(msg, "servo9_raw", 0)
         elif t == "VFR_HUD":
             self.speed = msg.groundspeed
+        elif t == "HEARTBEAT" and msg.type != mavutil.mavlink.MAV_TYPE_GCS:
+            self.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
+            self.mode = msg.custom_mode
 
     def heartbeat(self):
         self.m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_BATTERY,
@@ -162,6 +169,10 @@ class EnvSim:
         # 0 = output never commanded yet; SERVO9_TRIM 1900 means the default is ON
         return self.starlink_pwm == 0 or self.starlink_pwm > 1500
 
+    @property
+    def motor_driving(self):
+        return self.armed and self.mode != ROVER_MODE_HOLD
+
     def step(self):
         """Advance the physics to the current autopilot time."""
         dt = 0.0 if self.last_step_t is None else self.t_unix - self.last_step_t
@@ -171,8 +182,7 @@ class EnvSim:
 
         g = self.weather.irradiance(self.t_unix)
         p_solar = SOLAR_K_M2 * g
-        motor_on = abs(self.throttle_pct) > MOTOR_ON_THROTTLE_PCT
-        p_prop = PROP_W_PER_MS * self.speed if motor_on else 0.0
+        p_prop = PROP_W_PER_MS * self.speed if self.motor_driving else 0.0
         p_load = HOTEL_W + STARLINK_W * self.starlink_on + p_prop
         p_uncapped = BATT_ETA * p_solar - p_load - BATT_P_DRAIN_W
         p_net, v_bus, i_batt = self.batt.step(p_solar, p_load, dt)

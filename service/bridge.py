@@ -92,7 +92,9 @@ class BoatState:
 
     @property
     def starlink_on(self):
-        return self.starlink_pwm > 1500
+        # 0 = output 9 never commanded since boot -> relay sits at its default, SERVO9_TRIM 1900 = ON.
+        # Must match sim/env_sim.py; treating 0 as off meant the Pilot never sent the 'off' command.
+        return self.starlink_pwm == 0 or self.starlink_pwm > 1500
 
     def line(self):
         t = datetime.fromtimestamp(self.t_unix, timezone.utc).strftime("%Y-%m-%d %H:%M:%S")

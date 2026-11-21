@@ -9,7 +9,9 @@ On start:
 On every tick:
   - set the autopilot speed to the plan's speed for the current hour (HOLD if the plan says 0)
   - switch Starlink on/off according to the mission schedule
-  - log the state and send it to shore
+  - log the state
+
+Telemetry to shore: 1-minute averages (service/minute_bins.py), the same bins as the plan series.
 
 TEMPORARY: the mission is read from planner/mission.json and the forecast from
 data/weather/forecast.csv. Both should arrive from shore (mission upload / forecast pack).
@@ -31,6 +33,7 @@ from pathlib import Path
 
 import planner
 from bridge import Bridge
+from minute_bins import MinuteBins
 from shore_link import ShoreLink
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,33 +41,25 @@ STATE_DIR = ROOT / "service" / "state"
 
 
 def run(bridge, shore, pilot, tick_s):
+    """Two clocks, both autopilot time: telemetry = 1-minute averages (same bins as the plan series),
+    control = every tick_s."""
+    bins = MinuteBins()
     next_tick = 0.0
     while True:
         state = bridge.snapshot()
+        record = bins.add(state)
+        if record is not None:
+            shore.send(record)
         if state.t_unix and state.t_unix >= next_tick:
-            on_tick(state, shore, pilot)
+            on_tick(state, pilot)
             next_tick = state.t_unix + tick_s
         time.sleep(0.05)   # small wall-clock nap; the tick itself is autopilot time
 
 
-def on_tick(state, shore, pilot):
-    """One control step: apply the plan's setpoints, log what we see, report it to shore."""
+def on_tick(state, pilot):
+    """One control step: apply the plan's setpoints and log what we see."""
     pilot.apply(state)
     print(state.line())
-    fresh = state.battery_fresh()          # no recent battery message -> send null, never a fake 0
-    shore.send({
-        "t": state.t_unix,
-        "mode": state.mode,
-        "armed": state.armed,
-        "lat": state.lat, "lon": state.lon,
-        "speed": round(state.speed, 2),
-        "throttle_pct": round(state.throttle_pct, 1),
-        "starlink": state.starlink_on,
-        "batt_v": round(state.batt_v, 3) if fresh else None,
-        "batt_a": round(state.batt_a, 2) if fresh else None,
-        "load_w": round(state.load_v * state.load_a, 1) if fresh else None,
-        "solar_w": round(state.solar_v * state.solar_a, 1) if fresh else None,
-    })
 
 
 # ---------- autopilot ----------
@@ -177,7 +172,7 @@ def main():
     ap.add_argument("--conn", default="udpin:127.0.0.1:14551")
     ap.add_argument("--tick", type=float, default=60.0, help="seconds of autopilot time per tick")
     ap.add_argument("--shore", default="http://127.0.0.1:8000/api/telemetry")
-    ap.add_argument("--mission", default=str(ROOT / "planner" / "mission.json"), help="TEMPORARY: local mission")
+    ap.add_argument("--mission", default=str(ROOT / "planner" / "mission_mini.json"), help="TEMPORARY: local mission")
     ap.add_argument("--forecast", default=str(ROOT / "data" / "weather" / "forecast.csv"),
                     help="TEMPORARY: local forecast")
     ap.add_argument("--no-plan", action="store_true", help="skip planning on start")
