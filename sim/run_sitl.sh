@@ -2,7 +2,7 @@
 # Start the whole simulator: ArduPilot SITL Rover (boat) + the environment sim (env_sim.py).
 # Must match fetch_weather.py (same lat/lon and start date). Ctrl+C stops both.
 #
-#   ./run_sitl.sh -w            first run, or after editing scout.parm (wipes saved params)
+#   ./run_sitl.sh -w            first run, or after editing autopilot.parm (wipes saved params)
 #   ./run_sitl.sh               new run: scenario start time/place, env sim battery reset
 #   SPEEDUP=1 ./run_sitl.sh     real time
 #   ./run_sitl.sh --resume      carry on after a kill: time, place and battery from
@@ -76,7 +76,7 @@ cd "$ARDUPILOT_DIR/Rover"
   -l "$LAT,$LON,0,0" \
   --speedup "$SPEEDUP" \
   --use-dir "$RUN_DIR" \
-  --add-param-file "$SIM_DIR/scout.parm" \
+  --add-param-file "$SIM_DIR/autopilot.parm" \
   -A "--start-time $START_UNIX" \
   --out "udp:127.0.0.1:14551" \
   --console --map "${ARGS[@]}"

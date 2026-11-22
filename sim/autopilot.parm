@@ -1,4 +1,4 @@
-# Scout SITL parameters, loaded by sim/run_sitl.sh.
+# Autopilot (ArduPilot SITL) parameters, loaded by sim/run_sitl.sh.
 # Applied as defaults: after editing, restart once with -w.
 
 # Battery: the env sim publishes BATTERY_STATUS 0/1/2 itself, so SITL's own is off
@@ -19,3 +19,7 @@ CRUISE_SPEED 1.0
 # Water current ("tide"): the motorboat frame defaults to 0.5 m/s from the north. Off for now, so the
 # planner's motor model (speed through water) matches the sim. Wind and waves keep their defaults.
 SIM_TIDE_SPEED 0
+
+# Dataflash logs off: the default logs everything and filled sitl_run/logs with ~8 GB of .BIN files
+# nothing reads. Set a small mask (e.g. 1) if you ever need them in MAVExplorer.
+LOG_BITMASK 0
