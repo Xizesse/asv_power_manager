@@ -138,6 +138,11 @@ class Bridge:
         with self._lock:
             return replace(self._state)
 
+    def forget_reached(self):
+        """Clear the last MISSION_ITEM_REACHED (e.g. before a new mission starts: an old one must not count)."""
+        with self._lock:
+            self._state.reached_seq = -1
+
     def wait_until_ready(self, timeout_s=300):
         """Block until BoatState.not_ready() is empty (wall-clock timeout); print what is missing
         each time that changes. Returns the ready state, or None on timeout."""

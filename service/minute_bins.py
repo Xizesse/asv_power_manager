@@ -10,7 +10,7 @@ arrives, so shore is always one minute behind.
 
   mean of : speed, throttle_pct, starlink (fraction of the minute on, 0..1),
             batt_v, batt_a, load_w, solar_w (only samples with fresh battery data; None if none)
-  last of : mode, armed, lat, lon
+  last of : mode, armed, lat, lon, wp (MISSION_CURRENT seq: the item the autopilot is heading to)
 """
 import math
 
@@ -56,7 +56,8 @@ class MinuteBins:
             self.batt_sums["batt_a"] += state.batt_a
             self.batt_sums["load_w"] += state.load_v * state.load_a
             self.batt_sums["solar_w"] += state.solar_v * state.solar_a
-        self.last = {"mode": state.mode, "armed": state.armed, "lat": state.lat, "lon": state.lon}
+        self.last = {"mode": state.mode, "armed": state.armed, "lat": state.lat, "lon": state.lon,
+                     "wp": state.mission_seq}
         return done
 
     def _record(self):

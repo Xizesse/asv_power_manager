@@ -4,7 +4,7 @@ Steps, in the order the control loop does them:
   0. wait until the vehicle is ready: GPS 3D fix, EKF position estimate, home set, pre-arm checks pass
      (prints what is still missing whenever that changes)
   1. switch to MANUAL if in AUTO (each item written to a running AUTO mission restarts it),
-     upload the mission (planner/mission.json waypoints), then read back how many items it holds
+     upload the mission (shore/missions/mission.json waypoints), then read back how many items it holds
   2. set mode AUTO
   3. arm
   4. change speed
@@ -40,7 +40,7 @@ def step(name, fn):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--conn", default="udpin:127.0.0.1:14551")
-    ap.add_argument("--mission", default=str(ROOT / "planner" / "mission.json"))
+    ap.add_argument("--mission", default=str(ROOT / "shore" / "missions" / "mission.json"))
     ap.add_argument("--speed", type=float, default=1.0, help="m/s for the speed step")
     ap.add_argument("--skip", nargs="*", default=[], choices=STEPS, help="steps to skip")
     ap.add_argument("--watch", type=float, default=30, help="wall-clock seconds to watch the state after")

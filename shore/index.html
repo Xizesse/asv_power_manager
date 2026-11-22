@@ -24,6 +24,15 @@
   .card.empty { border-style: dashed; background: transparent; }
   .placeholder { display: flex; align-items: center; justify-content: center; color: #aaa; font-size: 14px; }
   @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+  #mission { font-size: 14px; padding: 12px 16px; min-height: 320px; box-sizing: border-box; }
+  #mission table { border-collapse: collapse; margin: 4px 0 8px; }
+  #mission td, #mission th { padding: 3px 10px 3px 0; text-align: left; }
+  #mission th { color: #777; font-weight: 500; font-size: 12px; }
+  #mission button { font-size: 13px; padding: 6px 12px; border: 1px solid #ccc; border-radius: 6px; background: #fff; cursor: pointer; margin-right: 8px; }
+  #mission button:hover:not(:disabled) { background: #eef4fb; border-color: #2f6fb0; color: #2f6fb0; }
+  #mission button:disabled { color: #aaa; cursor: default; }
+  #mstatus { margin-top: 8px; color: #555; }
+  #mstatus b.ok { color: #1a7f37; } #mstatus b.wait { color: #b26b00; }
 </style>
 </head>
 <body>
@@ -31,7 +40,7 @@
   <h1>Scout — shore view</h1>
   <div>
   <button id="zoom" title="Toggle between the whole mission and the last hour around the latest record">Zoom: last hour</button>
-  <button id="reset" title="Archive the telemetry on shore and start fresh (the plan is kept)">Reset data</button>
+  <button id="reset" title="Archive the telemetry on shore, delete the plan, and start fresh">Reset data</button>
   </div>
 </div>
 <div id="status">Waiting for data…</div>
@@ -40,11 +49,17 @@
   <div class="card"><div id="volt" class="plot"></div></div>
   <div class="card"><div id="power" class="plot"></div></div>
   <div class="card"><div id="speed" class="plot"></div></div>
-  <div class="card empty"><div class="plot placeholder">(reserved for a future plot)</div></div>
+  <div class="card" id="mission">
+    <b>Mission</b>
+    <table><thead><tr><th></th><th>mission</th><th>waypoints</th><th>route</th><th>arrive by</th><th>reserve</th></tr></thead>
+      <tbody id="mlist"><tr><td colspan="6">loading…</td></tr></tbody></table>
+    <button id="send" title="Stage the selected mission and the weather forecast; the boat gets them on its next Starlink contact">Send mission</button>
+    <button id="start" title="Tell the boat to start the mission it received" disabled>Start mission</button>
+    <div id="mstatus">No mission sent.</div>
+  </div>
 </div>
 
 <script>
-const STALE_AFTER_S = 30;   // wall-clock seconds without contact before we call the link stale
 const GAP_FACTOR = 3;       // a jump in boat time > 3x the usual record spacing = missing data
 const ZOOM_BEFORE_S = 45 * 60;  // zoomed view: 45 min before the latest record...
 const ZOOM_AFTER_S = 15 * 60;   // ...and 15 min after it, so the plan just ahead is visible
@@ -102,6 +117,7 @@ async function refresh() {
   if (hasPlan) {
     const s = plan.summary;
     document.getElementById("plan").innerHTML =
+      (plan.kind === "preview" ? `<b class="bad">Preview</b> (mission not started) · ` : "") +
       `Plan <b>${plan.plan_id}</b> (${plan.planner}) made at ${fmt(plan.created_t)} · ` +
       `${plan.route_km} km · arrival ${s.arrival ? s.arrival.replace("T", " ").replace("Z", " UTC") : "—"} · ` +
       `min ${s.min_v.toFixed(2)} V (reserve ${plan.reserve_v} V) · ` +
@@ -111,15 +127,21 @@ async function refresh() {
 
   if (r.length) {
   const last = r[r.length - 1];
-  const ago = data.last_contact ? (Date.now() / 1000 - data.last_contact) : Infinity;
-  const linkTxt = ago < STALE_AFTER_S
-    ? `<b class="ok">link up</b> (last contact ${ago.toFixed(0)} s ago)`
-    : `<b class="stale">link stale</b> (last contact ${isFinite(ago) ? ago.toFixed(0) + " s ago" : "never"})`;
+  const linkTxt = name => {
+    const w = data.last_contact[name];
+    const ago = w ? (Date.now() / 1000 - w) : Infinity;
+    const lastRec = [...r].reverse().find(x => x.link === name);
+    return `${name} ${isFinite(ago) ? `last contact ${ago.toFixed(0)} s ago` : "<b class=\"stale\">never</b>"}` +
+           (lastRec ? ` (data to ${fmt(lastRec.t)})` : "");
+  };
   const lastV = [...r].reverse().find(x => x.batt_v != null);
+  const lastFull = [...r].reverse().find(x => x.link === "starlink");
+  const nIr = r.filter(x => x.link === "iridium").length;
   document.getElementById("status").innerHTML =
-    `${linkTxt} · boat time ${fmt(last.t)} · ${last.mode} · ` +
+    `${linkTxt("starlink")} · ${linkTxt("iridium")}<br>` +
+    `boat time ${fmt(last.t)} · ${lastFull ? lastFull.mode : "mode unknown"} · ` +
     `${lastV ? lastV.batt_v.toFixed(2) + " V" : "no battery data"} · ` +
-    `Starlink ${last.starlink ? "on" : "off"} · ${r.length} records`;
+    `${r.length} records (${nIr} Iridium-only)`;
   }
 
   const tNow = r.length ? r[r.length - 1].t : null;
@@ -172,7 +194,7 @@ async function refresh() {
 }
 
 document.getElementById("reset").addEventListener("click", async () => {
-  if (!confirm("Clear the telemetry for a new mission? (Archived on shore, the plan is kept.)")) return;
+  if (!confirm("Clear the data for a new mission? (Telemetry is archived on shore; the plan is deleted.)")) return;
   try {
     await fetch("/api/reset", { method: "POST" });
   } catch (e) {
@@ -180,6 +202,7 @@ document.getElementById("reset").addEventListener("click", async () => {
     return;
   }
   ["volt", "power", "speed"].forEach(id => Plotly.purge(id));
+  document.getElementById("plan").textContent = "No plan received yet.";
   document.getElementById("status").textContent = "Data cleared. Waiting for data…";
   refresh();
 });
@@ -192,8 +215,49 @@ document.getElementById("zoom").addEventListener("click", () => {
   refresh();
 });
 
-refresh();
-setInterval(refresh, 5000);
+// ---- mission: send (stage for the boat) and start ----
+async function loadMissions() {
+  const { missions } = await fetch("/api/missions").then(x => x.json());
+  document.getElementById("mlist").innerHTML = missions.map((m, i) =>
+    `<tr><td><input type="radio" name="m" value="${m.name}" ${i === 0 ? "checked" : ""}></td>` +
+    `<td>${m.name}</td><td>${m.waypoints}</td><td>${m.route_km} km</td>` +
+    `<td>${m.arrive_by ? m.arrive_by.replace("T", " ").replace("Z", " UTC") : "—"}</td>` +
+    `<td>${m.reserve_v != null ? m.reserve_v + " V" : "—"}</td></tr>`).join("") ||
+    `<tr><td colspan="6">no shore/missions/mission*.json found</td></tr>`;
+}
+
+async function refreshMission() {
+  let st;
+  try { st = await fetch("/api/mission").then(x => x.json()); } catch (e) { return; }
+  const s = st.staged, b = st.boat || {};
+  const boatTxt = b.state ? `boat: <b>${b.state}</b>, has ${b.mission_id || "no mission"}` : "boat: not heard yet";
+  let txt = "No mission sent.";
+  if (s) {
+    const delivered = s.delivered, started = s.started;
+    txt = `Sent <b>${s.mission_id}</b>: ` +
+      (delivered ? `<b class="ok">received by boat</b>` : `<b class="wait">waiting for the boat's next Starlink contact</b>`) +
+      (s.start ? (started ? ` · <b class="ok">started</b>` : ` · <b class="wait">start requested</b>`) : "");
+  }
+  document.getElementById("mstatus").innerHTML = `${txt}<br>${boatTxt}`;
+  document.getElementById("start").disabled = !s || s.start;
+}
+
+document.getElementById("send").addEventListener("click", async () => {
+  const sel = document.querySelector('input[name="m"]:checked');
+  if (!sel) return;
+  await fetch("/api/mission", { method: "POST", headers: { "Content-Type": "application/json" },
+                                body: JSON.stringify({ name: sel.value }) });
+  refreshMission();
+});
+
+document.getElementById("start").addEventListener("click", async () => {
+  await fetch("/api/mission/start", { method: "POST" });
+  refreshMission();
+});
+
+loadMissions();
+refresh(); refreshMission();
+setInterval(() => { refresh(); refreshMission(); }, 5000);
 </script>
 </body>
 </html>

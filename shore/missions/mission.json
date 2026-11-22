@@ -1,15 +1,7 @@
 {
-  "start_time": "2025-07-15T06:00:00Z",
-  "start_v": 24.0,
   "speed_ms": 1.0,
   "reserve_v": 23.0,
   "arrive_by": "2025-07-22T12:00:00Z",
-  "starlink": {
-    "every_h": 2,
-    "first_h": 0,
-    "at_min": 47,
-    "on_min": 8
-  },
   "waypoints": [
     {
       "lat": 60.4609,

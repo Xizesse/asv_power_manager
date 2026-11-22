@@ -7,7 +7,8 @@ resets to the first waypoint (AP_Mission::init -> reset).
 Index convention: `next_wp` indexes mission["waypoints"]. We upload [home] + waypoints, so
 autopilot seq k == mission waypoint k - 1.
 
-mission_id = hash of the waypoint list: a different route starts from zero.
+mission_id = the id shore gave the mission (a new upload starts from zero, even the same route);
+without one, a hash of the waypoint list.
 """
 import hashlib
 import json
@@ -21,9 +22,9 @@ def mission_id(mission):
 
 
 class Progress:
-    def __init__(self, path, mission, fresh=False):
+    def __init__(self, path, mission, fresh=False, mission_id_=None):
         self.path = Path(path)
-        self.mission_id = mission_id(mission)
+        self.mission_id = mission_id_ or mission_id(mission)
         self.n_wp = len(mission["waypoints"])
         self.next_wp = 0
         self.reached = []                       # [{"wp": i, "t": autopilot unix s}]

@@ -48,6 +48,7 @@ def read_forecast(path):
 
 
 def starlink_on(t, sched):
+    """Starlink on the schedule at time t (a datetime or a DatetimeIndex)."""
     minutes_since = ((t.hour - sched["first_h"]) % sched["every_h"]) * 60 + t.minute - sched["at_min"]
     return (minutes_since >= 0) & (minutes_since < sched["on_min"])
 
