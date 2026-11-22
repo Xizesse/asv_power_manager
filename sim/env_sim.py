@@ -19,7 +19,7 @@ Survives SITL restarts: if the autopilot goes quiet for LINK_TIMEOUT_S, the env 
 tcp:5762 and waits for it. Time that doesn't move forward (no SYSTEM_TIME yet, 0, or backwards) is
 not integrated, and neither is a jump of more than MAX_STEP_S.
 
-This is the TRUTH model. Battery = the notebooks' latest model (nb 10 B1, same as nb 12).
+This is the TRUTH model. Battery = the notebooks' latest model (nb 11 B1, same as nb 12).
 Forecasts still can't be trivially perfect: the truth uses ERA5 solar and the real throttle/speed,
 the planner uses its own solar curve and the mission plan.
 
@@ -40,16 +40,16 @@ import pandas as pd
 from pymavlink import mavutil
 
 # ---------------- model parameters (from the notebooks; see claude/NOTES.md) ----------------
-SOLAR_K_M2 = 0.164          # P_solar = k * G, effective area eta*A (nb 09 Part 4)
+SOLAR_K_M2 = 0.164          # P_solar = k * G, effective area eta*A (nb 10 Part 4)
 HOTEL_W = 10.0              # base load (nb 06)
 STARLINK_W = 22.0           # extra while Starlink is on (nb 06)
-PROP_W_PER_MS = 64.8        # propulsion = k * v when the motor is driving (nb 06 k*v fit, best of v/v2/v3)
+PROP_W_PER_MS = 64.8        # propulsion = k * v when the motor is driving (nb 07 k*v fit, best of v/v2/v3)
 # Motor counts as driving when armed and not in HOLD. Not a throttle threshold: SITL's motorboat
 # holds ~0.6 m/s at <0.5 % throttle, so a throttle gate dropped the propulsion load entirely.
 ROVER_MODE_HOLD = 4
-# battery: nb 10 Model B1 (best free run with measured inputs; used by nb 12), copied 20 Nov
+# battery: nb 11 Model B1 (best free run with measured inputs; used by nb 12), copied 20 Nov
 BATT_K_WH_PER_V = 420.3     # Wh per volt of open-circuit voltage
-BATT_ETA = 1.138            # solar -> battery factor (fitted; >1 is unphysical, see nb 10 notes)
+BATT_ETA = 1.138            # solar -> battery factor (fitted; >1 is unphysical, see nb 11 notes)
 BATT_P_DRAIN_W = -0.312     # constant drain term (fitted)
 R_INTERNAL_OHM = 0.03921
 V_CAP = 25.0                # charge cap: no charging above 25 V terminal, extra solar is lost
@@ -83,7 +83,7 @@ class WeatherTruth:
 
 
 class Battery:
-    """nb 10 free_run(), step by step: OCV integrates net power / k, terminal V = OCV + R*I,
+    """nb 11 free_run(), step by step: OCV integrates net power / k, terminal V = OCV + R*I,
     charge cap at V_CAP (surplus solar lost)."""
 
     def __init__(self, v_start):

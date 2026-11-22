@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import numpy as np
 import pandas as pd
 
-# ---- models (notebook sections 4-7; nb 06/08/09) ----
+# ---- models (notebook sections 4-7; nb 06/07/09/10) ----
 K_SOLAR = 0.164                     # m^2
 HOTEL_W = 10.0
 STARLINK_W = 22.0

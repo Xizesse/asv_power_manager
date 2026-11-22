@@ -67,7 +67,7 @@ PROGRESS_FILE = STATE_DIR / "progress.json"
 PLAN_FILE = STATE_DIR / "plan.json"
 # Starlink: forced on while there is no mission running (WAITING_FOR_MISSION, READY) and until shore has
 # acked the plan; otherwise this schedule: on at at_min past every every_h hours (from first_h UTC) for
-# on_min minutes. Copies 15-19 Jul (nb 04). Boat setting, not part of a mission.
+# on_min minutes. Copies 15-19 Jul (nb 05). Boat setting, not part of a mission.
 STARLINK_SCHEDULE = {"every_h": 2, "first_h": 0, "at_min": 47, "on_min": 8}
 
 

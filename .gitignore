@@ -12,3 +12,4 @@ claude/
 .venv/
 service/state/
 sim/state/
+forecast/output/
