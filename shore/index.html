@@ -104,16 +104,19 @@ const CFG = { responsive: true };   // plots follow the grid column width
 function fmt(t) { return new Date(t * 1000).toISOString().replace("T", " ").slice(0, 19) + " UTC"; }
 
 async function refresh() {
-  let data, plan;
+  let data, plan, pred;
   try {
-    [data, plan] = await Promise.all([fetch("/api/telemetry").then(x => x.json()),
-                                      fetch("/api/plan").then(x => x.json())]);
+    [data, plan, pred] = await Promise.all([fetch("/api/telemetry").then(x => x.json()),
+                                            fetch("/api/plan").then(x => x.json()),
+                                            fetch("/api/prediction").then(x => x.json())]);
   } catch (e) {
     document.getElementById("status").textContent = "Shore server not reachable.";
     return;
   }
   const r = data.records;
-  const hasPlan = plan && plan.series;
+  const hasPlan = plan && plan.summary;
+  // the prediction (planned V, speed, load; solar added by shore) must belong to the plan shown
+  const hasPred = hasPlan && pred && pred.series && pred.plan_id === plan.plan_id;
   if (hasPlan) {
     const s = plan.summary;
     document.getElementById("plan").innerHTML =
@@ -123,7 +126,7 @@ async function refresh() {
       `min ${s.min_v.toFixed(2)} V (reserve ${plan.reserve_v} V) · ` +
       (s.feasible ? `<b class="good">feasible</b>` : `<b class="bad">NOT feasible</b> (${s.min_under_reserve} min under reserve)`);
   }
-  if (!r.length && !hasPlan) return;
+  if (!r.length && !hasPred) return;
 
   if (r.length) {
   const last = r[r.length - 1];
@@ -160,10 +163,10 @@ async function refresh() {
   const voltTraces = [
     { ...withGaps(r, "batt_v"), name: "Battery voltage (actual)", mode: "lines", line: { color: "#222" }, connectgaps: false },
   ];
-  if (hasPlan) {
-    const px = plan.series.t.map(utc);
+  if (hasPred) {
+    const px = pred.series.t.map(utc);
     voltTraces.push(
-      { x: px, y: plan.series.v_batt, name: "Battery voltage (planned)", mode: "lines",
+      { x: px, y: pred.series.v_batt, name: "Battery voltage (planned)", mode: "lines",
         line: { color: "#d9480f", dash: "dash" } },
       { x: [px[0], px[px.length - 1]], y: [plan.reserve_v, plan.reserve_v], name: `Reserve ${plan.reserve_v} V`,
         mode: "lines", line: { color: "#b42318", width: 1, dash: "dot" } });
@@ -173,21 +176,21 @@ async function refresh() {
     { ...withGaps(r, "solar_w"), name: "Solar (actual)", mode: "lines", line: { color: "#e8a317" }, connectgaps: false },
     { ...withGaps(r, "load_w"), name: "Load (actual)", mode: "lines", line: { color: "#2f6fb0" }, connectgaps: false },
   ];
-  if (hasPlan) {
-    const px = plan.series.t.map(utc);
-    powerTraces.push(
-      { x: px, y: plan.series.solar_w, name: "Solar (planned)", mode: "lines",
-        line: { color: "#e8a317", dash: "dot", width: 1.5 }, opacity: 0.8 },
-      { x: px, y: plan.series.load_w, name: "Load (planned)", mode: "lines",
-        line: { color: "#2f6fb0", dash: "dot", width: 1.5 }, opacity: 0.8 });
+  if (hasPred) {
+    const px = pred.series.t.map(utc);
+    if (pred.series.solar_w)
+      powerTraces.push({ x: px, y: pred.series.solar_w, name: "Solar (planned)", mode: "lines",
+                         line: { color: "#e8a317", dash: "dot", width: 1.5 }, opacity: 0.8 });
+    powerTraces.push({ x: px, y: pred.series.load_w, name: "Load (planned)", mode: "lines",
+                       line: { color: "#2f6fb0", dash: "dot", width: 1.5 }, opacity: 0.8 });
   }
   Plotly.react("power", powerTraces, layout("Power: actual vs plan", "W", powerTraces), CFG);
 
   const speedTraces = [
     { ...withGaps(r, "speed"), name: "Speed (actual, GPS)", mode: "lines", line: { color: "#2b8a3e" }, connectgaps: false },
   ];
-  if (hasPlan) {
-    speedTraces.push({ x: plan.series.t.map(utc), y: plan.series.speed, name: "Speed (planned)", mode: "lines",
+  if (hasPred) {
+    speedTraces.push({ x: pred.series.t.map(utc), y: pred.series.speed, name: "Speed (planned)", mode: "lines",
                        line: { color: "#2b8a3e", dash: "dot", width: 1.5, shape: "hv" }, opacity: 0.8 });
   }
   Plotly.react("speed", speedTraces, layout("Speed: actual vs plan", "m/s", speedTraces), CFG);

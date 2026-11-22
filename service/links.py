@@ -113,10 +113,11 @@ class StarlinkLink(Link):
         with self.lock:
             self.queue.append(dict(record, link="starlink"))
 
-    def send_plan(self, plan):
-        """Replace any unsent plan with this one; it goes out on the next contact."""
+    def send_plan(self, plan, prediction):
+        """Replace any unsent plan with this one; it goes out on the next contact, together with its
+        prediction (one POST, so shore never has a plan without its prediction)."""
         with self.lock:
-            self.pending_plan = plan
+            self.pending_plan = {"plan": plan, "prediction": prediction}
 
     def _deliver(self):
         with self.lock:
@@ -126,8 +127,8 @@ class StarlinkLink(Link):
             with self.lock:
                 if self.pending_plan is plan:     # a newer plan may have arrived meanwhile
                     self.pending_plan = None
-            self.plan_acked = plan.get("plan_id")
-            print(f"{self.name}: plan {plan.get('plan_id')} delivered", flush=True)
+            self.plan_acked = plan["plan"].get("plan_id")
+            print(f"{self.name}: plan {self.plan_acked} delivered", flush=True)
         # every contact = one telemetry POST (possibly with no records): it carries our status and
         # its reply is how shore talks to us
         with self.lock:

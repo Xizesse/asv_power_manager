@@ -64,7 +64,8 @@ STATE_DIR = ROOT / "service" / "state"
 MISSION_FILE = STATE_DIR / "mission.json"      # {"mission_id", "name", "mission", "received_t", "started"}
 FORECAST_FILE = STATE_DIR / "forecast.csv"
 PROGRESS_FILE = STATE_DIR / "progress.json"
-PLAN_FILE = STATE_DIR / "plan.json"
+PLAN_FILE = STATE_DIR / "plan.json"               # the decision: summary + hourly speeds (what the boat follows)
+PREDICTION_FILE = STATE_DIR / "prediction.json"   # what the plan expects per minute: battery V, speed, load
 # Starlink: forced on while there is no mission running (WAITING_FOR_MISSION, READY) and until shore has
 # acked the plan; otherwise this schedule: on at at_min past every every_h hours (from first_h UTC) for
 # on_min minutes. Copies 15-19 Jul (nb 05). Boat setting, not part of a mission.
@@ -105,6 +106,7 @@ class Controller:
         self.progress = None
         self.pilot = None
         self.plan = None
+        self.prediction = None
         self.state = "WAITING_FOR_MISSION"
         if MISSION_FILE.exists():
             self.saved = json.loads(MISSION_FILE.read_text())
@@ -149,8 +151,9 @@ class Controller:
                       "received_t": self.bridge.snapshot().t_unix, "started": False}
         save_json(MISSION_FILE, self.saved)
         PLAN_FILE.unlink(missing_ok=True)
+        PREDICTION_FILE.unlink(missing_ok=True)
         self.progress = Progress(PROGRESS_FILE, pkg["mission"], fresh=True, mission_id_=pkg["mission_id"])
-        self.pilot = self.plan = None
+        self.pilot = self.plan = self.prediction = None
         self.state = "READY"
         print(f"mission: received {pkg['mission_id']} ({len(pkg['mission']['waypoints'])} waypoints) "
               f"+ forecast -> READY, waiting for start")
@@ -188,24 +191,28 @@ class Controller:
         """Plan as soon as the mission is received (also after a restart in READY). Shown on shore as a
         preview; on start it becomes the plan the boat follows."""
         mission = dict(self.saved["mission"], starlink=STARLINK_SCHEDULE)
-        self.plan = plan_on_start(self.bridge, self.starlink, mission, self.progress, FORECAST_FILE,
-                                  kind="preview") or {"plan_id": None}   # failed: don't retry every tick
+        self.plan, self.prediction = plan_on_start(self.bridge, self.starlink, mission, self.progress,
+                                                   FORECAST_FILE, kind="preview")
+        self.plan = self.plan or {"plan_id": None}     # failed: don't retry every tick
 
     def _start(self):
         mission = dict(self.saved["mission"], starlink=STARLINK_SCHEDULE)
         if self.plan and self.plan.get("kind") == "preview":
             # No replan (for now): follow the plan made when the mission arrived. Whatever the battery
             # did while we waited for the start command is for runtime replanning (not built yet).
-            self.plan = dict(self.plan, kind="active", plan_id=self.plan["plan_id"].removesuffix("-preview"),
-                             started_t=self.bridge.snapshot().t_unix)
+            plan_id = self.plan["plan_id"].removesuffix("-preview")
+            self.plan = dict(self.plan, kind="active", plan_id=plan_id, started_t=self.bridge.snapshot().t_unix)
+            self.prediction = dict(self.prediction, plan_id=plan_id)
             save_json(PLAN_FILE, self.plan)
-            self.starlink.send_plan(self.plan)       # shore: no longer "preview"; Starlink on until acked
+            save_json(PREDICTION_FILE, self.prediction)
+            self.starlink.send_plan(self.plan, self.prediction)   # shore: no longer "preview"; Starlink on until acked
             print(f"planner: following {self.plan['plan_id']} (made when the mission arrived)")
         elif not self.no_plan:
             # no preview in memory (service restarted after the start) or it failed -> plan now
-            self.plan = plan_on_start(self.bridge, self.starlink, mission, self.progress, FORECAST_FILE)
+            self.plan, self.prediction = plan_on_start(self.bridge, self.starlink, mission, self.progress,
+                                                       FORECAST_FILE)
         else:
-            self.plan = None
+            self.plan = self.prediction = None
         self.bridge.wait_until_ready()
         self.bridge.forget_reached()
         start_mission(self.bridge, mission, self.progress)
@@ -335,34 +342,37 @@ def save_json(path, obj):
 
 def plan_on_start(bridge, starlink, mission, progress, forecast_path, kind="active"):
     """Plan from the current state over the waypoints not reached yet (after a restart: a replan).
-    kind: "preview" (mission received, not started: shown on shore, never followed) or "active"."""
+    kind: "preview" (mission received, not started: shown on shore, never followed) or "active".
+    Returns (plan, prediction), or (None, None) if there is nothing to plan or it failed."""
     if progress.done:
         print("planner: all waypoints reached -> no plan")
-        return None
+        return None, None
     remaining = dict(mission, waypoints=mission["waypoints"][progress.next_wp:])
     print(f"planner: {len(remaining['waypoints'])}/{progress.n_wp} waypoints left "
           f"(from waypoint {progress.next_wp}); waiting for time, battery voltage and position...")
     s = wait_for_plannable_state(bridge)
     if s is None:
         print("planner: no usable state after 120 s -> running without a plan")
-        return None
+        return None, None
     forecast = planner.read_forecast(forecast_path)
     tic = time.monotonic()
     try:
-        plan = planner.make_plan(remaining, forecast, s.t_unix, s.batt_v, s.lat, s.lon)
+        plan, prediction = planner.make_plan(remaining, forecast, s.t_unix, s.batt_v, s.lat, s.lon)
     except ValueError as e:                # e.g. deadline already passed, outside the forecast
         print(f"planner: cannot plan ({e}) -> running without a plan")
-        return None
+        return None, None
     plan["kind"] = kind
     if kind == "preview":                  # never the same id as the active plan made in the same minute
         plan["plan_id"] += "-preview"
+        prediction["plan_id"] = plan["plan_id"]
     sm = plan["summary"]
     print(f"planner: {kind} {plan['plan_id']} by {plan['planner']} in {time.monotonic() - tic:.1f} s wall: "
           f"{plan['route_km']} km, arrival {sm['arrival']}, min {sm['min_v']} V "
           f"(reserve {plan['reserve_v']}), feasible={sm['feasible']}")
     save_json(PLAN_FILE, plan)
-    starlink.send_plan(plan)
-    return plan
+    save_json(PREDICTION_FILE, prediction)
+    starlink.send_plan(plan, prediction)
+    return plan, prediction
 
 
 def main():
@@ -377,9 +387,9 @@ def main():
     a = ap.parse_args()
 
     if a.fresh:
-        for f in (MISSION_FILE, FORECAST_FILE, PROGRESS_FILE, PLAN_FILE):
+        for f in (MISSION_FILE, FORECAST_FILE, PROGRESS_FILE, PLAN_FILE, PREDICTION_FILE):
             f.unlink(missing_ok=True)
-        print("mission: --fresh -> saved mission, forecast, progress and plan deleted")
+        print("mission: --fresh -> saved mission, forecast, progress, plan and prediction deleted")
 
     # Bridge = our only MAVLink connection to the autopilot. start() blocks until the autopilot's
     # heartbeat arrives, asks it to stream the messages we need, and starts the reader thread

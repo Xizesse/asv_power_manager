@@ -1,0 +1,45 @@
+// Components: boat, links, shore, simulator. Render with docs/diagrams/render.sh
+digraph components {
+  rankdir=LR; compound=true; newrank=true;
+  node [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=11];
+  edge [fontname="Helvetica", fontsize=9];
+
+  subgraph cluster_sim {
+    label="Simulator (sim/)"; style="rounded,dashed"; color=gray50;
+    sitl    [label="ArduPilot SITL Rover\n(autopilot)", fillcolor="#e8f0fe"];
+    envsim  [label="env_sim.py\nsolar (ERA5) · load · battery"];
+    mavproxy[label="MAVProxy"];
+  }
+
+  subgraph cluster_boat {
+    label="Boat computer (service/)"; style=rounded;
+    bridge  [label="bridge.py\nMAVLink"];
+    control [label="control_loop.py\nstate machine"];
+    planner [label="planner.py\n+ forecast/model.py"];
+    links   [label="links.py\nStarlink · Iridium queues"];
+  }
+
+  subgraph cluster_links {
+    label="Satellite links (shore/proxy.py)"; style="rounded,dashed"; color=gray50;
+    pstar [label="Starlink proxy\n:8001"];
+    pirid [label="Iridium proxy\n:8002"];
+  }
+
+  subgraph cluster_shore {
+    label="Shore (shore/)"; style=rounded;
+    server  [label="server.py\nFlask :8000"];
+    browser [label="index.html\nbrowser", fillcolor="#fef7e0"];
+  }
+
+  envsim   -> sitl     [label="BATTERY_STATUS\nSERIAL1 tcp:5762", dir=both];
+  sitl     -> mavproxy [dir=both];
+  mavproxy -> bridge   [label="udp:14551", dir=both];
+  bridge   -> control  [label="state / commands", dir=both];
+  control  -> planner  [label="plan"];
+  control  -> links    [label="records, plan"];
+  links    -> pstar    [label="full records, plan\n(reply: mission, start)", dir=both];
+  links    -> pirid    [label="5-min summary"];
+  pstar    -> server   [dir=both];
+  pirid    -> server;
+  browser  -> server   [label="HTTP /api", dir=both];
+}

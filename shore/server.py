@@ -11,10 +11,17 @@
   GET  /api/telemetry   page reads them back: ONE record per minute ("t"). A Starlink record (full)
                         replaces an Iridium one (5 fields) for the same minute; repeats are dropped.
                         last_contact = wall time of the last POST per link.
-  POST /api/plan        boat sends its latest plan (shore/data/plan.json; history in plans.jsonl)
+  POST /api/plan        boat sends {"plan", "prediction"} (one POST, made by the same planner run):
+                          plan        the decision (summary + hourly speeds) -> shore/data/plan.json
+                                      (history in plans.jsonl)
+                          prediction  per minute: battery V, speed, load -> shore/data/prediction.json
   GET  /api/plan        page reads the latest plan ({} if none)
-  POST /api/reset       start fresh: telemetry.jsonl is moved to data/archive/, plan.json and
-                        plans.jsonl are deleted (the boat re-sends its plan when it next replans).
+  GET  /api/prediction  page reads the latest prediction ({} if none), plus the planned solar per
+                        minute ("solar_w"), worked out here from the forecast shore sent with the mission
+                        (data/weather/forecast.csv) with the same rule the boat uses (service/problem.py)
+  POST /api/reset       start fresh: telemetry.jsonl is moved to data/archive/, plan.json,
+                        prediction.json and plans.jsonl are deleted (the boat re-sends its plan when
+                        it next replans).
                         The staged mission is kept (the boat may be running it).
   GET  /api/missions    missions the operator can send (shore/missions/mission*.json), with a short summary
   POST /api/mission     {"name": ...}: stage that mission + data/weather/forecast.csv for the boat
@@ -32,15 +39,20 @@ Run:
 """
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
 
 HERE = Path(__file__).parent
+sys.path.insert(0, str(HERE.parent / "service"))
+import problem  # noqa: E402  service/problem.py: the boat's solar rule (forecast -> W per minute)
+
 DATA = HERE / "data" / "telemetry.jsonl"
 PLAN = HERE / "data" / "plan.json"
 PLANS = HERE / "data" / "plans.jsonl"
+PREDICTION = HERE / "data" / "prediction.json"
 OUTBOX = HERE / "data" / "outbox.json"        # mission staged for the boat
 BOAT = HERE / "data" / "boat.json"            # boat's last reported status
 MISSIONS_DIR = HERE / "missions"            # operator missions (what "Send mission" offers)
@@ -170,10 +182,10 @@ def telemetry():
 
 @app.post("/api/plan")
 def receive_plan():
-    plan = request.get_json(force=True)
-    tmp = PLAN.with_suffix(".tmp")
-    tmp.write_text(json.dumps(plan))
-    tmp.replace(PLAN)
+    msg = request.get_json(force=True)
+    plan, prediction = msg["plan"], msg["prediction"]
+    write_json(PREDICTION, prediction)
+    write_json(PLAN, plan)
     with open(PLANS, "a") as f:
         f.write(json.dumps(plan) + "\n")
     last_contact["starlink"] = time.time()
@@ -182,13 +194,38 @@ def receive_plan():
 
 @app.get("/api/plan")
 def latest_plan():
-    return jsonify(json.loads(PLAN.read_text()) if PLAN.exists() else {})
+    return jsonify(read_json(PLAN, {}))
+
+
+_solar_cache = {}   # plan_id -> planned solar (W per minute)
+
+
+def planned_solar(plan, n):
+    """Planned solar for the plan's first n minutes: the boat's rule (service/problem.py) on our forecast."""
+    key = plan.get("plan_id")
+    if key not in _solar_cache:
+        try:
+            p_solar = problem.Problem(plan["mission"], problem.read_forecast(FORECAST)).p_solar
+            _solar_cache[key] = [round(float(x), 1) for x in p_solar]
+        except (ValueError, KeyError, FileNotFoundError) as e:
+            print(f"planned solar: not available ({e})", flush=True)
+            _solar_cache[key] = None
+    sol = _solar_cache[key]
+    return None if sol is None else sol[:n]
+
+
+@app.get("/api/prediction")
+def latest_prediction():
+    pred, plan = read_json(PREDICTION, {}), read_json(PLAN, {})
+    if pred and plan and pred.get("plan_id") == plan.get("plan_id"):
+        pred["series"]["solar_w"] = planned_solar(plan, len(pred["series"]["t"]))
+    return jsonify(pred)
 
 
 @app.post("/api/reset")
 def reset():
-    deleted = [p.name for p in (PLAN, PLANS) if p.exists()]
-    for p in (PLAN, PLANS):
+    deleted = [p.name for p in (PLAN, PLANS, PREDICTION) if p.exists()]
+    for p in (PLAN, PLANS, PREDICTION):
         p.unlink(missing_ok=True)
     if not DATA.exists():
         return jsonify(ok=True, archived=None, deleted=deleted)
