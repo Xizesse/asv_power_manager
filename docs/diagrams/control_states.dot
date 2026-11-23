@@ -1,0 +1,36 @@
+// Boat service state machine (service/control_loop.py, Controller). Main states in one straight line.
+digraph states {
+  rankdir=TB; nodesep=0.8; ranksep=0.55;
+  graph [fontname="Helvetica", fontsize=18, pad=0.3];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=3.5, group=main];
+  edge  [fontname="Helvetica", fontsize=13, fontcolor="#1a5fb4", color=gray35, penwidth=1.3, arrowsize=0.7];
+
+  connecting [label="CONNECTING\nno autopilot yet · links already run", style="rounded,dashed"];
+  waiting    [label="WAITING\nHOLD · Starlink on"];
+  planning   [label="PLANNING\nmaking the preview plan · HOLD"];
+  ready      [label="READY\npreview sent · waiting for start"];
+  starting   [label="STARTING\nupload waypoints · AUTO · arm"];
+  running    [label="RUNNING\nfollow hourly speeds", fillcolor="#e8f0fe"];
+  done       [label="DONE\nHOLD · Starlink on"];
+
+  connecting -> waiting  [label="  first heartbeat,\n  no mission", weight=10];
+  waiting    -> planning [label="  mission received\n  (from any state)", weight=10];
+  planning   -> ready    [label="  plan made", weight=10];
+  ready      -> starting [label="  start command", weight=10];
+  starting   -> running  [weight=10];
+  running    -> done     [label="  last waypoint", weight=10];
+
+  // boot decision on the first heartbeat, by what is saved on disk
+  connecting:e -> planning:e [label="saved,\nnot started", style=dotted, weight=0];
+  connecting:e -> starting:e [label="saved,\nstarted", style=dotted, weight=0];
+
+  // abort: from any state back to WAITING. A straight red line up the left side, through
+  // invisible points that sit on the same rows as the states.
+  node [shape=point, width=0.03, color="#c01c28", label="", group=left];
+  edge [color="#c01c28", style=dashed, dir=none, weight=10];
+  a1 -> a2 -> a3; a3 -> a4 [label="   abort\n   (from any state)\n   delete mission", fontcolor="#c01c28"]; a4 -> a5 -> a6;
+  a1 -> waiting [dir=forward, weight=1, minlen=2];
+  a6 -> done    [weight=1, minlen=2];
+  { rank=same; a1; waiting; }  { rank=same; a2; planning; } { rank=same; a3; ready; }
+  { rank=same; a4; starting; } { rank=same; a5; running; }  { rank=same; a6; done; }
+}

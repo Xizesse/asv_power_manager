@@ -1,0 +1,20 @@
+// Mission from shore to boat. Yellow = shore, blue = boat.
+digraph mission_flow {
+  rankdir=TB; nodesep=0.5; ranksep=0.5;
+  graph [fontname="Helvetica", fontsize=18, labeljust=l];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=3.5];
+  edge  [fontname="Helvetica", fontsize=13, fontcolor="#1a5fb4", color=gray35, penwidth=1.3, arrowsize=0.7];
+  a  [label="1. Operator sends mission", fillcolor="#fef7e0"];
+  q  [label="Starlink on?", shape=diamond, width=2.2];
+  w  [label="Iridium reply: wake\n→ boat forces Starlink on", fillcolor="#fef7e0"];
+  c  [label="2. Starlink reply: mission + forecast", fillcolor="#fef7e0"];
+  d  [label="3. Boat plans, sends preview", fillcolor="#e8f0fe"];
+  e  [label="4. Operator presses Start", fillcolor="#fef7e0"];
+  f  [label="5. Reply (either link): start", fillcolor="#fef7e0"];
+  g  [label="6. Boat runs the plan", fillcolor="#e8f0fe"];
+  a -> q;
+  q -> c [label="  yes"];
+  q -> w [label="  no"];
+  w -> c;
+  c -> d -> e -> f -> g;
+}

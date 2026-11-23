@@ -19,7 +19,8 @@ Survives SITL restarts: if the autopilot goes quiet for LINK_TIMEOUT_S, the env 
 tcp:5762 and waits for it. Time that doesn't move forward (no SYSTEM_TIME yet, 0, or backwards) is
 not integrated, and neither is a jump of more than MAX_STEP_S.
 
-This is the TRUTH model. Battery = the notebooks' latest model (nb 11 B1, same as nb 12).
+This is the TRUTH model, with the notebooks' latest energy model (nb 13): load = 10 W + 22 W Starlink
++ k_mode v^2 (nb 08), battery nb 11 B1, solar 0.164 m^2 x irradiance (nb 10).
 Forecasts still can't be trivially perfect: the truth uses ERA5 solar and the real throttle/speed,
 the planner uses its own solar curve and the mission plan.
 
@@ -43,10 +44,14 @@ from pymavlink import mavutil
 SOLAR_K_M2 = 0.164          # P_solar = k * G, effective area eta*A (nb 10 Part 4)
 HOTEL_W = 10.0              # base load (nb 06)
 STARLINK_W = 22.0           # extra while Starlink is on (nb 06)
-PROP_W_PER_MS = 64.8        # propulsion = k * v when the motor is driving (nb 07 k*v fit, best of v/v2/v3)
-# Motor counts as driving when armed and not in HOLD. Not a throttle threshold: SITL's motorboat
-# holds ~0.6 m/s at <0.5 % throttle, so a throttle gate dropped the propulsion load entirely.
-ROVER_MODE_HOLD = 4
+# propulsion = k_mode * v**2 (nb 08 section 2 / nb 13 4.3), W per (m/s)^2, v = speed over ground.
+# Keyed by ArduPilot Rover custom_mode. Mode 17 never shows up in SITL but is kept to match the model.
+ROVER_MODE_MANUAL, ROVER_MODE_HOLD, ROVER_MODE_AUTO = 0, 4, 10
+K_PROP_MODE = {ROVER_MODE_AUTO: 62.7, 17: 60.6}
+K_PROP_OTHER = K_PROP_MODE[ROVER_MODE_AUTO]   # GUIDED, RTL, LOITER...: the model has no k, the motor drives, use AUTO's
+# Motor counts as driving when armed and not in MANUAL or HOLD (nb 13: MANUAL = motor off).
+# Not a throttle threshold: SITL's motorboat holds ~0.6 m/s at <0.5 % throttle, so a throttle
+# gate dropped the propulsion load entirely.
 # battery: nb 11 Model B1 (best free run with measured inputs; used by nb 12), copied 20 Nov
 BATT_K_WH_PER_V = 420.3     # Wh per volt of open-circuit voltage
 BATT_ETA = 1.138            # solar -> battery factor (fitted; >1 is unphysical, see nb 11 notes)
@@ -236,7 +241,11 @@ class EnvSim:
 
     @property
     def motor_driving(self):
-        return self.armed and self.mode != ROVER_MODE_HOLD
+        return self.armed and self.mode not in (ROVER_MODE_MANUAL, ROVER_MODE_HOLD)
+
+    @property
+    def k_prop(self):
+        return K_PROP_MODE.get(self.mode, K_PROP_OTHER)
 
     def step(self):
         """Advance the physics to the current autopilot time."""
@@ -248,7 +257,7 @@ class EnvSim:
 
         g = self.weather.irradiance(self.t_unix)
         p_solar = SOLAR_K_M2 * g
-        p_prop = PROP_W_PER_MS * self.speed if self.motor_driving else 0.0
+        p_prop = self.k_prop * self.speed ** 2 if self.motor_driving else 0.0
         p_load = HOTEL_W + STARLINK_W * self.starlink_on + p_prop
         p_uncapped = BATT_ETA * p_solar - p_load - BATT_P_DRAIN_W
         p_net, v_bus, i_batt = self.batt.step(p_solar, p_load, dt)

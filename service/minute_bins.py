@@ -1,4 +1,5 @@
-"""1-minute averages of the boat state, for shore telemetry.
+"""BIN_S averages of the boat state, for shore telemetry. BIN_S = 10 s for the demo (60 s at sea:
+the plan series is per minute, and Starlink/Iridium bytes cost energy and money).
 
 Same bins as the plan series (service/planner.py, SERIES_EVERY_MIN = 1): one bin per whole minute of
 autopilot time, labelled by the minute's start ("t"), value = mean over that minute. So actual and plan
@@ -13,6 +14,8 @@ arrives, so shore is always one minute behind.
   last of : mode, armed, lat, lon, wp (MISSION_CURRENT seq: the item the autopilot is heading to)
 """
 import math
+
+BIN_S = 10          # seconds of autopilot time per bin
 
 MEAN_KEYS = ("speed", "throttle_pct", "starlink")
 BATT_KEYS = ("batt_v", "batt_a", "load_w", "solar_w")
@@ -38,7 +41,7 @@ class MinuteBins:
         if not state.t_unix or state.t_unix == self.last_t:
             return None
         self.last_t = state.t_unix
-        minute = math.floor(state.t_unix / 60) * 60
+        minute = math.floor(state.t_unix / BIN_S) * BIN_S
         done = None
         if self.minute is not None and minute != self.minute and self.n:
             done = self._record()

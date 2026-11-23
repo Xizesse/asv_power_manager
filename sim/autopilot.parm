@@ -8,9 +8,14 @@ BATT_MONITOR 0
 SERVO9_FUNCTION 0
 SERVO9_TRIM 1900
 
-# No GCS/radio failsafes in sim (MAVProxy can't keep up at high speedup)
-FS_GCS_ENABLE 0
-FS_THR_ENABLE 0
+# Service loss -> HOLD. The low-power service is the autopilot's "GCS" (sysid 200, 1 Hz heartbeat from
+# service/bridge.py). No heartbeat from sysid 200 for FS_TIMEOUT s -> FS_ACTION. MAVProxy/QGC heartbeats
+# (sysid 255) don't count, so a dead service is never hidden by a ground station.
+MAV_GCS_SYSID 200
+FS_GCS_ENABLE 1
+FS_TIMEOUT 5          # s (shared with the RC failsafe)
+FS_ACTION 2           # 2 = Hold
+FS_THR_ENABLE 0       # no RC radio in sim
 
 # Scout cruises at ~1 m/s (mission data); SITL's default is much faster
 WP_SPEED 1.0

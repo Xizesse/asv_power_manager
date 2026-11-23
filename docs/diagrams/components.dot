@@ -1,45 +1,49 @@
-// Components: boat, links, shore, simulator. Render with docs/diagrams/render.sh
+// Components, top to bottom: shore, links, boat, simulator. Render with docs/diagrams/render.sh
 digraph components {
-  rankdir=LR; compound=true; newrank=true;
-  node [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=11];
-  edge [fontname="Helvetica", fontsize=9];
+  rankdir=TB; newrank=true; nodesep=0.9; ranksep=0.9;
+  graph [fontname="Helvetica", fontsize=18, labeljust=l];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=2.6];
+  edge  [fontname="Helvetica", fontsize=12, fontcolor="#1a5fb4", color=gray35, penwidth=1.3,
+         dir=both, arrowsize=0.7];
 
-  subgraph cluster_sim {
-    label="Simulator (sim/)"; style="rounded,dashed"; color=gray50;
-    sitl    [label="ArduPilot SITL Rover\n(autopilot)", fillcolor="#e8f0fe"];
-    envsim  [label="env_sim.py\nsolar (ERA5) · load · battery"];
-    mavproxy[label="MAVProxy"];
-  }
-
-  subgraph cluster_boat {
-    label="Boat computer (service/)"; style=rounded;
-    bridge  [label="bridge.py\nMAVLink"];
-    control [label="control_loop.py\nstate machine"];
-    planner [label="planner.py\n+ forecast/model.py"];
-    links   [label="links.py\nStarlink · Iridium queues"];
+  subgraph cluster_shore {
+    label="Shore"; style=rounded;
+    browser [label="Browser\nindex.html", fillcolor="#fef7e0", group=main];
+    server  [label="Shore server\nserver.py · :8000", group=main];
   }
 
   subgraph cluster_links {
-    label="Satellite links (shore/proxy.py)"; style="rounded,dashed"; color=gray50;
+    label="Satellite links (proxy.py)"; style="rounded,dashed"; color=gray50;
     pstar [label="Starlink proxy\n:8001"];
     pirid [label="Iridium proxy\n:8002"];
   }
 
-  subgraph cluster_shore {
-    label="Shore (shore/)"; style=rounded;
-    server  [label="server.py\nFlask :8000"];
-    browser [label="index.html\nbrowser", fillcolor="#fef7e0"];
+  subgraph cluster_boat {
+    label="Boat computer (service/)"; style=rounded;
+    links   [label="Links\nlinks.py", group=main];
+    control [label="Control loop\ncontrol_loop.py", fillcolor="#e8f0fe", group=main];
+    planner [label="Planner\nplanner.py"];
+    bridge  [label="MAVLink bridge\nbridge.py", group=main];
   }
 
-  envsim   -> sitl     [label="BATTERY_STATUS\nSERIAL1 tcp:5762", dir=both];
-  sitl     -> mavproxy [dir=both];
-  mavproxy -> bridge   [label="udp:14551", dir=both];
-  bridge   -> control  [label="state / commands", dir=both];
-  control  -> planner  [label="plan"];
-  control  -> links    [label="records, plan"];
-  links    -> pstar    [label="full records, plan\n(reply: mission, start)", dir=both];
-  links    -> pirid    [label="5-min summary"];
-  pstar    -> server   [dir=both];
-  pirid    -> server;
-  browser  -> server   [label="HTTP /api", dir=both];
+  subgraph cluster_sim {
+    label="Simulator (sim/)"; style="rounded,dashed"; color=gray50;
+    sitl   [label="Autopilot\nArduPilot SITL", group=main];
+    envsim [label="Environment\nenv_sim.py"];
+  }
+
+  browser -> server  [label="  HTTP /api\n  telemetry · plan · send mission"];
+  server  -> pstar   [label="HTTP  "];
+  server  -> pirid   [label="  HTTP"];
+  pstar   -> links   [label="HTTP :8001  \nonly when Starlink on  \nup: full data, plan  \ndown: mission, start, abort  "];
+  pirid   -> links   [label="  HTTP :8002, every 5 min\n  up: 5 points + status\n  down: wake, start, abort"];
+  links   -> control [label="  in-memory queues"];
+  control -> planner [label="hourly\nspeeds"];
+  control -> bridge  [label="  mode · speed · waypoints\n  Starlink relay"];
+  bridge  -> sitl    [label="  MAVLink\n  udp:14551 (via MAVProxy)"];
+  sitl    -> envsim  [label="MAVLink, SERIAL1 tcp:5762\nthrottle · Starlink → \n← battery V, load, solar"];
+
+  { rank=same; pstar; pirid; }
+  { rank=same; control; planner; }
+  { rank=same; sitl; envsim; }
 }

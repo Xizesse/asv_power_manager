@@ -1,0 +1,16 @@
+
+[Unit]
+Description=Scout low-power mission mode (control loop)
+After=network.target
+
+[Service]
+Type=simple
+User=xizesse
+WorkingDirectory=/home/xizesse/Documents/scout_challenge
+ExecStart=/home/xizesse/Documents/scout_challenge/.venv/bin/python -u service/control_loop.py
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

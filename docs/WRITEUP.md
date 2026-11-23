@@ -22,6 +22,8 @@ At 1 m/s in AUTO: motor 63 W, total 73 W (95 W with Starlink). Solar in: up to 5
 - battery1 and battery2 voltage are the same measurement; Globalstar `battery_pct` is always 0 (01).
 
 ## How good the forecast is
+![forecast model](img/forecast_model.png)
+
 _Todo: still fitted on the same 17 days it forecasts; no held-out test yet._
 - 24 h pieces: mean |end error| 0.36 V. Free run 17 days: RMSE 0.95 V (12).
 - Battery model alone (measured inputs): RMSE 0.40 V, 0.16 V on 24 h pieces.
@@ -36,10 +38,23 @@ _Todo: still fitted on the same 17 days it forecasts; no held-out test yet._
 - **Waypoints:** uploads the mission's waypoints to the autopilot.
 - **Speed:** sets the speed to follow, one per hour, from the plan.
 
+![service states](img/control_states.png)
+
+![planner](img/planner.png)
+
 ## Where each part runs
 ![components](img/components.png)
+
+![mission flow](img/mission_flow.png)
+
+![link drop](img/link_drop.png)
+
+![autopilot restart](img/autopilot_restart.png)
 
 _Todo: text._
 
 ## What we chose not to build
-_Todo._
+- **Winds and currents.** We built one environmental model (solar from weather data) and its pipeline. Wind and current would use exactly the same pipeline, but feed the load model instead of the solar model.
+- **Replanning.** If the measured voltage drifts from the plan (below or above), the boat should replan from that point. Everything needed is already on the boat: mission, progress, forecast, planner. It could also switch Starlink on and ask shore for a new weather forecast.
+- **Adaptive planning.** Learn from the mission as it runs, then replan. If today's solar is much lower than forecast, correct the solar model. If 1 m/s costs much more load than expected, the wind/current model is probably wrong: correct the load model.
+

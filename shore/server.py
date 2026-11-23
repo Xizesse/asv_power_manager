@@ -2,8 +2,7 @@
 
   POST /api/telemetry   boat sends records (appended to shore/data/telemetry.jsonl). Each record says
                         which link brought it ("link": starlink | iridium).
-                          Iridium:  a JSON list of records.
-                          Starlink: {"boat": status, "records": [...]}. The REPLY carries shore -> boat
+                          Both: {"link", "boat": status, "records": [...]}. The REPLY carries shore -> boat
                           messages in "to_boat": the staged mission + forecast until the boat reports
                           that mission id, then the start command until the boat reports started.
                           Both are one-shot: once confirmed they are never sent again, so a boat started
@@ -20,13 +19,18 @@
                         minute ("solar_w"), worked out here from the forecast shore sent with the mission
                         (data/weather/forecast.csv) with the same rule the boat uses (service/problem.py)
   POST /api/reset       start fresh: telemetry.jsonl is moved to data/archive/, plan.json,
-                        prediction.json and plans.jsonl are deleted (the boat re-sends its plan when
-                        it next replans).
-                        The staged mission is kept (the boat may be running it).
+                        prediction.json, plans.jsonl and the staged mission (outbox.json) are deleted
+                        (the boat re-sends its plan when it next replans). Safe while the boat runs a
+                        mission: Abort falls back to the mission the boat reports.
   GET  /api/missions    missions the operator can send (shore/missions/mission*.json), with a short summary
   POST /api/mission     {"name": ...}: stage that mission + data/weather/forecast.csv for the boat
                         (new mission id each time; data/outbox.json)
   POST /api/mission/start   ask the boat to start the staged mission
+  POST /api/mission/abort   ask the boat to drop the staged mission (or, if none, the one it reports):
+                        the boat deletes mission, forecast, progress and plan -> WAITING_FOR_MISSION.
+                        Not delivered yet -> simply never sent.
+  Commands travel on both links: Starlink replies carry mission / start / abort; Iridium replies carry
+  wake (Starlink on, a mission is waiting) / start / abort. Both links bring the boat's status.
   GET  /api/mission     the staged mission (no forecast text) + the boat's last reported status
   GET  /                the web page (shore/index.html)
 
@@ -77,23 +81,27 @@ def write_json(path, obj):
 @app.post("/api/telemetry")
 def receive():
     body = request.get_json(force=True)
-    if isinstance(body, dict):                       # Starlink: status + records, reply carries to_boat
-        records, boat, link = body.get("records", []), body.get("boat") or {}, "starlink"
-        write_json(BOAT, dict(boat, seen_t=time.time()))
-    else:                                            # Iridium: plain list
+    if isinstance(body, dict):                       # {"link", "boat": status, "records"}; reply carries to_boat
+        records, boat = body.get("records", []), body.get("boat") or {}
+        link = body.get("link", "starlink")
+        write_json(BOAT, dict(boat, seen_t=time.time(), via=link))
+    else:                                            # old Iridium format: plain list, no status
         records, boat, link = body, None, (body[0].get("link", "iridium") if body else "iridium")
     with open(DATA, "a") as f:
         for r in records:
             f.write(json.dumps(r) + "\n")
     last_contact[link] = time.time()
-    return jsonify(ok=True, received=len(records), to_boat=to_boat(boat))
+    return jsonify(ok=True, received=len(records), to_boat=to_boat(boat, link))
 
 
-def to_boat(boat):
-    """What shore still has to tell the boat. Confirmation comes from the boat's own status, so a lost
-    reply is simply sent again on the next contact; once confirmed, never again."""
+def to_boat(boat, link):
+    """What shore still has to tell the boat. Confirmation comes from the boat's own status (from either
+    link), so a lost reply is simply sent again on the next contact; once confirmed, never again.
+
+    Starlink can carry everything. Iridium only short commands (an SBD message to the boat is ~270 B):
+    instead of the mission it sends "wake" = switch Starlink on, a mission is waiting."""
     out = read_json(OUTBOX)
-    if boat is None or out is None:
+    if not boat or out is None:
         return {}
     has_it = boat.get("mission_id") == out["mission_id"]
     changed = False
@@ -101,9 +109,17 @@ def to_boat(boat):
         out["delivered"], changed = True, True
     if has_it and boat.get("started") and not out.get("started"):
         out["started"], changed = True, True
+    if out.get("abort") and not has_it and not out.get("aborted"):
+        out["aborted"], changed = True, True       # boat no longer holds it (or never got it)
+        PLAN.unlink(missing_ok=True)                 # the page stops showing the aborted plan
+        PREDICTION.unlink(missing_ok=True)           # (history stays in plans.jsonl)
     if changed:
         write_json(OUTBOX, out)
+    if out.get("abort"):
+        return {"abort": out["mission_id"]} if has_it else {}
     if not out.get("delivered"):
+        if link == "iridium":
+            return {"wake": out["mission_id"]}
         return {"mission": {k: out[k] for k in ("mission_id", "name", "mission", "forecast_csv")}}
     if has_it and out.get("start") and not out.get("started"):
         return {"start": out["mission_id"]}
@@ -148,9 +164,25 @@ def stage_mission():
 @app.post("/api/mission/start")
 def start_mission():
     out = read_json(OUTBOX)
-    if out is None:
+    if out is None or out.get("abort"):
         return jsonify(ok=False, error="no mission staged"), 409
     out["start"] = True
+    write_json(OUTBOX, out)
+    return jsonify(ok=True, mission_id=out["mission_id"])
+
+
+@app.post("/api/mission/abort")
+def abort_mission():
+    """Abort the boat's mission: the staged one, or (if nothing is staged, e.g. shore data was deleted)
+    whatever mission the boat last reported. Sent over both links until the boat reports it gone."""
+    out = read_json(OUTBOX)
+    boat = read_json(BOAT) or {}
+    if out is None or out.get("aborted"):
+        if not boat.get("mission_id"):
+            return jsonify(ok=False, error="no mission to abort"), 409
+        out = {"mission_id": boat["mission_id"], "name": boat.get("name"), "staged_t": time.time(),
+               "start": False, "delivered": True, "started": bool(boat.get("started"))}
+    out["abort"] = True
     write_json(OUTBOX, out)
     return jsonify(ok=True, mission_id=out["mission_id"])
 
@@ -224,8 +256,8 @@ def latest_prediction():
 
 @app.post("/api/reset")
 def reset():
-    deleted = [p.name for p in (PLAN, PLANS, PREDICTION) if p.exists()]
-    for p in (PLAN, PLANS, PREDICTION):
+    deleted = [p.name for p in (PLAN, PLANS, PREDICTION, OUTBOX) if p.exists()]
+    for p in (PLAN, PLANS, PREDICTION, OUTBOX):
         p.unlink(missing_ok=True)
     if not DATA.exists():
         return jsonify(ok=True, archived=None, deleted=deleted)

@@ -1,0 +1,17 @@
+// Planner (service/planner.py)
+digraph planner {
+  rankdir=TB; nodesep=0.5; ranksep=0.5;
+  graph [fontname="Helvetica", fontsize=18, labeljust=l];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=3.5];
+  edge  [fontname="Helvetica", fontsize=13, fontcolor="#1a5fb4", color=gray35, penwidth=1.3, arrowsize=0.7];
+  in   [label="Mission · battery V · solar forecast", fillcolor="#fef7e0"];
+  q    [label="Deadline?", shape=diamond, width=2];
+  se   [label="ShiftEnergy\nraise the lowest voltage"];
+  sd   [label="SlowDown\nslow before the reserve"];
+  ot   [label="On time?", shape=diamond, width=2];
+  late [label="SlowDown · marked late"];
+  out  [label="One speed per hour", fillcolor="#e8f0fe"];
+  in -> q;
+  q -> se [label="  yes"]; q -> sd [label="  no"];
+  se -> ot; ot -> out [label="  yes"]; ot -> late [label="  no"]; late -> out; sd -> out;
+}

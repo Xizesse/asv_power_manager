@@ -8,9 +8,13 @@ background thread; the control loop only hands records over and never waits for 
                    boat's status (state, which mission it holds, started?). Shore -> boat: in the REPLY
                    to that same POST (the boat never listens on a port): a new mission + forecast, or
                    the start command. It contacts shore every few seconds even with no data, to poll.
-  IridiumLink   -> proxy on :8002 -> shore :8000. Always on. Every 5 one-minute bins (autopilot time)
-                   it sends ONE small message with those 5 points: voltage, load, solar, speed, plus
-                   the latest position and the waypoint the autopilot is heading to.
+  IridiumLink   -> proxy on :8002 -> shore :8000. Always on. Every IRIDIUM_EVERY_S (10 s wall clock),
+                   whatever the state, ONE small message: the boat's status + health (state, mission,
+                   autopilot OK / LOST, mode, battery V, position) and the 1-minute data points
+                   (voltage, load, solar, speed) collected since the last one. Shore -> boat: short commands only, in
+                   the reply (like an SBD mobile-terminated message, ~270 B): wake / start / abort.
+                   A mission (~110 KB with the forecast) never fits: "wake" asks the boat to switch
+                   Starlink on and fetch it.
 
 Killing a proxy = that link is down. Records stay queued and go out on the next successful contact.
 Shore keeps one record per minute: a Starlink record replaces an Iridium one for the same minute.
@@ -23,11 +27,16 @@ import time
 import urllib.request
 from collections import deque
 
+import log
+
 MAX_QUEUE = 10_000        # oldest items are dropped beyond this (10,000 minutes ~ 7 days)
 MAX_BATCH = 500
 
-IRIDIUM_EVERY_BINS = 5    # one message per 5 one-minute bins = every 5 min of autopilot time
+IRIDIUM_EVERY_BINS = 1    # one message per one-minute bin = every minute (sim runs in real time)
 IRIDIUM_KEYS = ("t", "batt_v", "load_w", "solar_w", "speed")
+IRIDIUM_EVERY_S = 10.0    # wall s (10 for the demo; a real boat ~5-30 min, SBD is billed per message): one Iridium message this often, whatever the state, with the boat
+                          # status + health (even with no autopilot = no data: shore still hears it)
+MAX_BACKLOG_MSGS = 10     # after an outage: queued bins sent this many per POST
 
 
 class Link:
@@ -40,6 +49,20 @@ class Link:
         self.queue = deque(maxlen=MAX_QUEUE)
         self.lock = threading.Lock()
         self.link_up = None           # None = no contact tried yet
+        self.radio_on = None          # last seen available(); logged when it changes
+        self.down_since = None        # time.monotonic() when the link went down
+
+    def status(self):
+        """Short text for the health summary: 'UP', 'DOWN 40 s', 'off', '?', plus the queue."""
+        if self.radio_on is False:
+            txt = "off"
+        elif self.link_up is None:
+            txt = "?"
+        elif self.link_up:
+            txt = "UP"
+        else:
+            txt = f"DOWN {time.monotonic() - self.down_since:.0f} s"
+        return f"{txt}, {len(self.queue)} queued"
 
     def start(self):
         threading.Thread(target=self._run, daemon=True, name=self.name).start()
@@ -73,17 +96,25 @@ class Link:
     def _run(self):
         while True:
             time.sleep(self.every_s)
-            if not self.available():
+            on = bool(self.available())
+            if on != self.radio_on and self.radio_on is not None:
+                log.info(self.name, f"terminal {'ON' if on else 'OFF'}")
+            self.radio_on = on
+            if not on:
                 continue
             try:
                 sent = self._deliver()
             except Exception as e:            # any error: stay alive, retry on the next contact
                 if self.link_up is not False:
-                    print(f"{self.name}: link DOWN ({e}); {len(self.queue)} queued", flush=True)
+                    log.warning(self.name, f"link DOWN ({e}); {len(self.queue)} queued")
+                    self.down_since = time.monotonic()
                 self.link_up = False
                 continue
-            if sent and not self.link_up:
-                print(f"{self.name}: link UP, delivered {sent}", flush=True)
+            if sent and self.link_up is False:
+                log.info(self.name, f"link UP after {time.monotonic() - self.down_since:.0f} s, "
+                                    f"delivered {sent}")
+            elif sent and self.link_up is None:
+                log.info(self.name, f"link UP, delivered {sent}")
             if sent:
                 self.link_up = True
 
@@ -119,6 +150,11 @@ class StarlinkLink(Link):
         with self.lock:
             self.pending_plan = {"plan": plan, "prediction": prediction}
 
+    def drop_plan(self):
+        """Forget an unsent plan (its mission was aborted)."""
+        with self.lock:
+            self.pending_plan = None
+
     def _deliver(self):
         with self.lock:
             plan = self.pending_plan
@@ -128,7 +164,7 @@ class StarlinkLink(Link):
                 if self.pending_plan is plan:     # a newer plan may have arrived meanwhile
                     self.pending_plan = None
             self.plan_acked = plan["plan"].get("plan_id")
-            print(f"{self.name}: plan {self.plan_acked} delivered", flush=True)
+            log.info(self.name, f"plan {self.plan_acked} delivered to shore")
         # every contact = one telemetry POST (possibly with no records): it carries our status and
         # its reply is how shore talks to us
         with self.lock:
@@ -145,12 +181,19 @@ class StarlinkLink(Link):
 
 
 class IridiumLink(Link):
-    """Small status messages: every 5 one-minute bins, those 5 points in one message."""
+    """Small health messages: every IRIDIUM_EVERY_S, the boat status + health + any queued data bins.
+    report()   -> boat status, read when the message is SENT (so a message queued while the link was
+                  down still carries the current status)
+    on_reply() <- shore's reply: short commands for the control loop (wake / start / abort)"""
     name = "iridium"
 
-    def __init__(self, base_url="http://127.0.0.1:8002", every_s=1.0):
+    def __init__(self, base_url="http://127.0.0.1:8002", report=dict, on_reply=lambda reply: None,
+                 every_s=1.0):
         super().__init__(base_url, every_s)
+        self.report = report
+        self.on_reply = on_reply
         self.bins = []                # bins collected for the next message
+        self.last_post = 0.0          # time.monotonic() of the last POST
 
     def add_bin(self, record):
         """Feed every finished 1-minute bin. Every IRIDIUM_EVERY_BINS bins, one message is queued."""
@@ -165,15 +208,24 @@ class IridiumLink(Link):
             self.queue.append(msg)
 
     def _deliver(self):
-        """One queued message = one POST (a list of 5 records), oldest first."""
-        n = 0
+        """Every IRIDIUM_EVERY_S (wall clock), whatever the state: one POST with the boat status + health
+        and the data bins queued since the last one. A backlog (link was down) goes out in chunks of
+        MAX_BACKLOG_MSGS in the same contact. Each reply may carry a command for the boat."""
+        if time.monotonic() - self.last_post < IRIDIUM_EVERY_S:
+            return None
+        n_rec = 0
         while True:
+            with self.lock:
+                msgs = list(self.queue)[:MAX_BACKLOG_MSGS]
+            records = [r for m in msgs for r in m]
+            reply = self._post("/api/telemetry", {"link": "iridium", "boat": self.report(), "records": records})
+            self.last_post = time.monotonic()
+            with self.lock:
+                for _ in range(len(msgs)):
+                    self.queue.popleft()
+            n_rec += len(records)
+            self.on_reply(reply)
             with self.lock:
                 if not self.queue:
                     break
-                msg = self.queue[0]
-            self._post("/api/telemetry", msg)
-            with self.lock:
-                self.queue.popleft()
-            n += 1
-        return f"{n} messages" if n else None
+        return f"status + {n_rec} records" if n_rec else "status"

@@ -4,8 +4,6 @@ A plan = one speed per hour from SPEEDS. The problem (route, solar, Starlink, ru
 forecast/model.py) is service/problem.py; a planner only returns a list of hourly speeds.
 
 The boat only ever sees the *forecast* (never ERA5).
-TEMPORARY: the forecast is read from data/weather/forecast.csv on disk. On the real boat it has to
-arrive from shore (forecast pack, design log section 5).
 
 Main entry point for the boat: make_plan(mission, forecast, now_unix, batt_v, lat, lon) -> JSON-able dict.
 """
@@ -160,8 +158,10 @@ def make_plan(mission, forecast, now_unix, batt_v, lat, lon):
       prediction  what the plan expects, per minute: battery V, speed, load (same plan_id).
                   No solar: it came from shore in the forecast, so shore works it out itself.
 
-    Planner: ShiftEnergy with arrive_by, SlowDown without. If ShiftEnergy can't arrive on time, the
-    deadline is impossible: SlowDown plans the earliest safe arrival instead, reported late (not feasible).
+    Planner: ShiftEnergy with arrive_by, SlowDown without. If ShiftEnergy's plan is not feasible (late,
+    or on time only by going under the reserve), the reserve wins: SlowDown plans the earliest arrival
+    that keeps the reserve, reported late (not feasible). Exception: a boat already under the reserve
+    keeps the deadline plan (no plan can keep a reserve it has already lost).
     """
     t0 = pd.Timestamp(datetime.fromtimestamp(now_unix, timezone.utc)).floor("min")
     eff = dict(mission)
@@ -174,16 +174,21 @@ def make_plan(mission, forecast, now_unix, batt_v, lat, lon):
     speeds = [float(v) for v in planner.solve(problem)]
     df, s = problem.evaluate(speeds)
 
-    if problem.deadline is not None and not s["on_time"]:
-        # The deadline can't be met. Still give the boat a safe plan: plan again without the deadline
-        # (SlowDown: earliest arrival, slowing down where needed to stay above the reserve) ...
+    if problem.deadline is not None and not s["feasible"]:
+        # Not feasible: late, or on time only by going under the reserve. The RESERVE wins over the
+        # deadline: plan again without it (SlowDown: earliest arrival, slowing down where needed to stay
+        # above the reserve), so the boat arrives late but safe ...
         late = Problem({k: v for k, v in eff.items() if k != "arrive_by"}, forecast)
-        planner = SlowDown()
-        speeds = [float(v) for v in planner.solve(late)]
-        df, s = late.evaluate(speeds)
-        # ... and judge it against the real deadline: late, so not feasible
-        s["on_time"] = s["arrival"] is not None and s["arrival"] <= problem.deadline
-        s["feasible"] = bool(s["on_time"] and s["min_V"] >= problem.reserve)
+        safe = SlowDown()
+        safe_speeds = [float(v) for v in safe.solve(late)]
+        safe_df, safe_s = late.evaluate(safe_speeds)
+        # ... used if it really keeps the reserve (or if the deadline plan is late anyway). If the boat
+        # already starts under the reserve no plan keeps it: keep the deadline plan, which recovers.
+        if safe_s["min_V"] >= problem.reserve or not s["on_time"]:
+            planner, speeds, df, s = safe, safe_speeds, safe_df, safe_s
+            # judged against the real deadline: late, so not feasible
+            s["on_time"] = s["arrival"] is not None and s["arrival"] <= problem.deadline
+            s["feasible"] = bool(s["on_time"] and s["min_V"] >= problem.reserve)
     plan_id = f"plan-{t0:%Y%m%dT%H%MZ}"
 
     plan = {
@@ -191,7 +196,6 @@ def make_plan(mission, forecast, now_unix, batt_v, lat, lon):
         "created_t": float(now_unix),
         "planner": planner.name,
         "load_model": f"forecast/model.py: k·v² AUTO {K_AUTO}",
-        "forecast_source": "data/weather/forecast.csv (TEMPORARY: should come from shore)",
         "mission": eff,
         "route_km": round(problem.route_km, 2),
         "reserve_v": problem.reserve,

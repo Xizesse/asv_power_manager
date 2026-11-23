@@ -15,6 +15,8 @@ import json
 import os
 from pathlib import Path
 
+import log
+
 
 def mission_id(mission):
     wps = json.dumps(mission["waypoints"], sort_keys=True)
@@ -29,23 +31,23 @@ class Progress:
         self.next_wp = 0
         self.reached = []                       # [{"wp": i, "t": autopilot unix s}]
         if fresh:
-            print(f"progress: --fresh -> mission {self.mission_id} from waypoint 0")
+            log.info("progress", f"--fresh -> mission {self.mission_id} from waypoint 0")
             self.save()                         # overwrite the old file now
         else:
             self._load()
 
     def _load(self):
         if not self.path.exists():
-            print(f"progress: none saved -> mission {self.mission_id} from waypoint 0")
+            log.info("progress", f"none saved -> mission {self.mission_id} from waypoint 0")
             return
         saved = json.loads(self.path.read_text())
         if saved.get("mission_id") != self.mission_id:
-            print(f"progress: saved file is for mission {saved.get('mission_id')}, "
+            log.info("progress", f"saved file is for mission {saved.get('mission_id')}, "
                   f"this is {self.mission_id} -> from waypoint 0")
             return
         self.next_wp = int(saved["next_wp"])
         self.reached = saved.get("reached", [])
-        print(f"progress: loaded, next waypoint {self.next_wp}/{self.n_wp}")
+        log.info("progress", f"loaded, next waypoint {self.next_wp}/{self.n_wp}")
 
     @property
     def done(self):
@@ -59,7 +61,7 @@ class Progress:
         self.next_wp = wp + 1
         self.reached.append({"wp": wp, "t": int(t_unix)})
         self.save()
-        print(f"progress: reached waypoint {wp} -> next {self.next_wp}/{self.n_wp}")
+        log.info("progress", f"reached waypoint {wp} -> next {self.next_wp}/{self.n_wp}")
         return True
 
     def save(self):

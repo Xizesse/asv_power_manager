@@ -1,6 +1,7 @@
 """MAVLink bridge: the only part of the service that talks to the autopilot.
 
-- A background thread reads MAVLink and keeps `BoatState` up to date.
+- A background thread reads MAVLink and keeps `BoatState` up to date. `start()` never blocks: the
+  autopilot is picked up whenever its heartbeat arrives, and again after every gap (reboot).
 - `snapshot()` gives the control loop a copy of the latest state.
 - `set_mode()`, `set_speed()`, `set_starlink()`, `arm()` send a command and wait for its ack.
 - `upload_mission()` replaces the autopilot's mission with a list of waypoints.
@@ -17,9 +18,14 @@ from datetime import datetime, timezone
 
 from pymavlink import mavutil
 
+import log
+
 AUTOPILOT_COMP = 1
+OWN_SYSID = 200               # the autopilot's "GCS" (MAV_GCS_SYSID 200): our heartbeat keeps its failsafe quiet
 OWN_COMP = 191                # MAV_COMP_ID_ONBOARD_COMPUTER
+HEARTBEAT_EVERY_S = 1.0       # our own heartbeat; ArduPilot holds after FS_TIMEOUT (5 s) without it
 STARLINK_SERVO = 9
+HEARTBEAT_GAP_S = 3.0        # heartbeat back after a longer silence = reconnect (re-request streams)
 STARLINK_ON_PWM, STARLINK_OFF_PWM = 1900, 1100
 STREAMS_HZ = {"SYSTEM_TIME": 1, "GLOBAL_POSITION_INT": 1, "VFR_HUD": 1, "SERVO_OUTPUT_RAW": 1,
               "BATTERY_STATUS": 1,
@@ -48,6 +54,10 @@ class BoatState:
     throttle_pwm: int = 0        # output 3
     starlink_pwm: int = 0        # output 9
     last_heartbeat: float = 0.0  # autopilot time of last heartbeat
+    # liveness, in WALL-clock time (time.monotonic): autopilot time stops when the autopilot dies,
+    # so "how long since we heard from it" can only be measured with our own clock. 0 = never.
+    heartbeat_wall: float = 0.0
+    battery_wall: float = 0.0
     # BATTERY_STATUS by id: 0 = battery (net, signed), 1 = total load, 2 = solar
     batt_v: float = 0.0
     batt_a: float = 0.0
@@ -85,6 +95,14 @@ class BoatState:
             missing.append("pre-arm checks")
         return missing
 
+    def heartbeat_age(self):
+        """Wall seconds since the last autopilot heartbeat (inf = never)."""
+        return time.monotonic() - self.heartbeat_wall if self.heartbeat_wall else float("inf")
+
+    def battery_age(self):
+        """Wall seconds since the last BATTERY_STATUS (inf = never)."""
+        return time.monotonic() - self.battery_wall if self.battery_wall else float("inf")
+
     def battery_fresh(self, max_age_s=30.0):
         """True if battery data arrived recently (in autopilot time)."""
         return self.batt_t > 0 and self.t_unix - self.batt_t <= max_age_s
@@ -112,7 +130,7 @@ class BoatState:
 
 class Bridge:
     def __init__(self, conn="udpin:127.0.0.1:14551"):
-        self.m = mavutil.mavlink_connection(conn, source_system=1, source_component=OWN_COMP)
+        self.m = mavutil.mavlink_connection(conn, source_system=OWN_SYSID, source_component=OWN_COMP)
         self._state = BoatState()
         self._lock = threading.Lock()
         self._acks = queue.Queue()
@@ -120,18 +138,38 @@ class Bridge:
 
     # ---------- lifecycle ----------
     def start(self):
-        """Wait for the autopilot, ask for the messages we need, start the reader thread."""
-        print("bridge: waiting for autopilot heartbeat...")
-        while True:   # wait for the *autopilot's* heartbeat (ignore GCS, env sim, etc.)
-            hb = self.m.recv_match(type="HEARTBEAT", blocking=True)
-            if hb.get_srcComponent() == AUTOPILOT_COMP and hb.type != mavutil.mavlink.MAV_TYPE_GCS:
-                self.m.target_system, self.m.target_component = hb.get_srcSystem(), AUTOPILOT_COMP
-                break
-        print(f"bridge: connected to system {self.m.target_system}")
-        for name, hz in STREAMS_HZ.items():
-            msg_id = getattr(mavutil.mavlink, f"MAVLINK_MSG_ID_{name}")
-            self._command(mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, msg_id, 1e6 / hz, wait=False)
-        threading.Thread(target=self._reader, daemon=True).start()
+        """Start the reader thread and return at once (never blocks). The reader picks up the
+        autopilot whenever its heartbeat arrives (see _on_autopilot_heartbeat)."""
+        log.info("bridge", "listening for the autopilot heartbeat...")
+        threading.Thread(target=self._reader, daemon=True, name="mavlink").start()
+        threading.Thread(target=self._heartbeat, daemon=True, name="heartbeat").start()
+
+    def _heartbeat(self):
+        """Our heartbeat, 1 Hz, on its own thread: the main loop may block for seconds (planning) and
+        that must not trip the autopilot's failsafe. So it proves the PROCESS is alive, not the loop.
+        Sent only once the autopilot is known (udpin learns where to send from what it receives)."""
+        while True:
+            if self._state.heartbeat_wall:
+                try:
+                    self.m.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                                              mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0,
+                                              mavutil.mavlink.MAV_STATE_ACTIVE)
+                except OSError as e:
+                    log.warning("bridge", f"heartbeat send failed ({e})")
+            time.sleep(HEARTBEAT_EVERY_S)
+
+    def _on_autopilot_heartbeat(self, src_system, first):
+        """First heartbeat, or first after a gap (autopilot rebooted / link back): (re)target it and
+        ask for the messages we need. ArduPilot forgets SET_MESSAGE_INTERVAL on reboot, so this is
+        repeated every time the heartbeat comes back."""
+        self.m.target_system, self.m.target_component = src_system, AUTOPILOT_COMP
+        log.info("bridge", f"{'connected to' if first else 'reconnected to'} autopilot "
+                           f"(system {src_system}), requesting message streams")
+        for name, hz in STREAMS_HZ.items():   # sent directly, not via _command: this runs on the reader
+            msg_id = getattr(mavutil.mavlink, f"MAVLINK_MSG_ID_{name}")   # thread and must not drain the
+            self.m.mav.command_long_send(src_system, AUTOPILOT_COMP,        # acks the main loop waits for
+                                         mavutil.mavlink.MAV_CMD_SET_MESSAGE_INTERVAL, 0,
+                                         msg_id, 1e6 / hz, 0, 0, 0, 0, 0)
 
     def snapshot(self):
         """Copy of the latest state (safe to use while the reader keeps updating)."""
@@ -152,13 +190,13 @@ class Bridge:
             s = self.snapshot()
             missing = s.not_ready()
             if not missing:
-                print("bridge: vehicle ready")
+                log.info("bridge", "vehicle ready")
                 return s
             if missing != last:
-                print("bridge: waiting for: " + "; ".join(missing))
+                log.info("bridge", "waiting for: " + "; ".join(missing))
                 last = missing
             time.sleep(0.5)
-        print(f"bridge: vehicle not ready after {timeout_s:.0f} s: {'; '.join(self.snapshot().not_ready())}")
+        log.warning("bridge", f"vehicle not ready after {timeout_s:.0f} s: {'; '.join(self.snapshot().not_ready())}")
         return None
 
     # ---------- commands ----------
@@ -200,14 +238,14 @@ class Bridge:
             if msg.get_type() == "MISSION_ACK":
                 if msg.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
                     return True
-                print(f"bridge: mission rejected: {_enum('MAV_MISSION_RESULT', msg.type)}")
+                log.error("bridge", f"mission rejected: {_enum('MAV_MISSION_RESULT', msg.type)}")
                 return False
             if msg.get_type() == "MISSION_COUNT":
                 continue
             if msg.seq >= len(items):
-                print(f"bridge: autopilot asked for item {msg.seq}, we only have {len(items)}")
+                log.error("bridge", f"autopilot asked for mission item {msg.seq}, we only have {len(items)}")
                 continue
-            print(f"bridge: mission item {msg.seq + 1}/{len(items)} requested")
+            log.debug("bridge", f"mission item {msg.seq + 1}/{len(items)} requested")
             wp = items[msg.seq]
             self.m.mav.mission_item_int_send(
                 self.m.target_system, AUTOPILOT_COMP, msg.seq,
@@ -216,7 +254,7 @@ class Bridge:
                 0, 0, 0, 0,              # hold time, accept radius (0 = WP_RADIUS), pass radius, yaw
                 int(wp["lat"] * 1e7), int(wp["lon"] * 1e7), 0)
             deadline = time.monotonic() + timeout   # each request restarts the timeout
-        print("bridge: mission upload timed out (no request/ack from the autopilot)")
+        log.error("bridge", "mission upload timed out (no request/ack from the autopilot)")
         return False
 
     def mission_count(self, timeout=5.0):
@@ -255,9 +293,9 @@ class Bridge:
             if ack.command == cmd:
                 if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
                     return True
-                print(f"bridge: {_enum('MAV_CMD', cmd)} refused: {_enum('MAV_RESULT', ack.result)}")
+                log.warning("bridge", f"{_enum('MAV_CMD', cmd)} refused: {_enum('MAV_RESULT', ack.result)}")
                 return False
-        print(f"bridge: {_enum('MAV_CMD', cmd)}: no ack within {timeout} s")
+        log.warning("bridge", f"{_enum('MAV_CMD', cmd)}: no ack within {timeout} s")
         return False
 
     def _reader(self):
@@ -275,7 +313,9 @@ class Bridge:
                 self._acks.put(msg)
                 continue
             if t == "STATUSTEXT":
-                print(f"autopilot: {msg.text}")
+                # ArduPilot's own messages, at its severity (0-3 error, 4 warning, else info)
+                level = "error" if msg.severity <= 3 else "warning" if msg.severity == 4 else "info"
+                getattr(log, level)("ardupilot", msg.text)
                 continue
             if t in ("MISSION_REQUEST_INT", "MISSION_REQUEST", "MISSION_ACK", "MISSION_COUNT"):
                 self._mission_msgs.put(msg)
@@ -283,9 +323,15 @@ class Bridge:
             with self._lock:
                 s = self._state
                 if t == "HEARTBEAT":
+                    if msg.type == mavutil.mavlink.MAV_TYPE_GCS:
+                        continue
+                    now = time.monotonic()
+                    first = s.heartbeat_wall == 0
+                    reconnect = first or now - s.heartbeat_wall > HEARTBEAT_GAP_S
                     s.mode = mavutil.mode_string_v10(msg)
                     s.armed = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
                     s.last_heartbeat = s.t_unix
+                    s.heartbeat_wall = now
                 elif t == "SYSTEM_TIME" and msg.time_unix_usec:
                     s.t_unix = msg.time_unix_usec / 1e6
                 elif t == "GLOBAL_POSITION_INT":
@@ -308,6 +354,8 @@ class Bridge:
                     s.mission_seq = msg.seq
                 elif t == "MISSION_ITEM_REACHED":
                     s.reached_seq = msg.seq
+            if t == "HEARTBEAT" and reconnect:        # outside the lock: it sends commands
+                self._on_autopilot_heartbeat(msg.get_srcSystem(), first)
 
 
     def _on_battery(self, msg):
@@ -316,6 +364,7 @@ class Bridge:
         with self._lock:
             s = self._state
             s.batt_t = s.t_unix
+            s.battery_wall = time.monotonic()
             if msg.id == 0:
                 s.batt_v, s.batt_a = volts, amps
             elif msg.id == 1:

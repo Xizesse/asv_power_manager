@@ -1,0 +1,15 @@
+// Restarts (control_loop.py, progress.py)
+digraph ap_restart {
+  rankdir=TB; nodesep=0.5; ranksep=0.5;
+  graph [fontname="Helvetica", fontsize=18, labeljust=l];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=3.5];
+  edge  [fontname="Helvetica", fontsize=13, fontcolor="#1a5fb4", color=gray35, penwidth=1.3, arrowsize=0.7];
+  a  [label="Progress saved at each waypoint"];
+  b  [label="Autopilot reboots", fillcolor="#fde2e1"];
+  s  [label="Service restarts", fillcolor="#fde2e1"];
+  c  [label="Wait until vehicle ready"];
+  s2 [label="Reload mission · replan"];
+  e  [label="Re-upload · next waypoint · AUTO", fillcolor="#e6f4ea"];
+  a -> b -> c -> e;
+  a -> s -> s2 -> e;
+}

@@ -18,7 +18,7 @@ set -euo pipefail
 LAT=60.5
 LON=1.5
 START="2025-07-14T11:00:00Z"
-SPEEDUP=${SPEEDUP:-10}   # target only; this laptop achieved ~20x
+SPEEDUP=${SPEEDUP:-1}   # target only; this laptop achieved ~20x
 RESUME_GAP_S=${RESUME_GAP_S:-10}   # >= env_sim SAVE_EVERY_S, so resumed time is never before the kill
 
 SIM_DIR="$(cd "$(dirname "$0")" && pwd)"
