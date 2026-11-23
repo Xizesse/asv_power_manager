@@ -1,49 +1,70 @@
 // Components, top to bottom: shore, links, boat, simulator. Render with docs/diagrams/render.sh
 digraph components {
-  rankdir=TB; newrank=true; nodesep=0.9; ranksep=0.9;
+  rankdir=TB; newrank=true; nodesep=0.5; ranksep=1.75;
   graph [fontname="Helvetica", fontsize=18, labeljust=l];
-  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=2.6];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=15, width=2.8];
   edge  [fontname="Helvetica", fontsize=12, fontcolor="#1a5fb4", color=gray35, penwidth=1.3,
          dir=both, arrowsize=0.7];
+  // files on disk: cylinders, left-aligned lines
+  node  [];
 
   subgraph cluster_shore {
     label="Shore"; style=rounded;
-    browser [label="Browser\nindex.html", fillcolor="#fef7e0", group=main];
-    server  [label="Shore server\nserver.py · :8000", group=main];
+    browser  [label=<<b>Browser</b> · index.html<br/><font point-size="11">Plotly: forecast vs actual, send / start / abort mission</font>>, fillcolor="#fef7e0", group=main];
+    server   [label=<<b>Shore server</b> · server.py · :8000<br/><font point-size="11">Flask: stores what the boat sends, stages missions</font>>, group=main];
+    shoredb  [shape=cylinder, style=filled, fillcolor="#f1f1f1", width=2.4,
+              label=<<b>shore/data/</b><br align="left"/><font point-size="11">telemetry.jsonl · telemetry<br align="left"/>plan.json, plans.jsonl · plans<br align="left"/>outbox.json · staged mission<br align="left"/>boat.json · last boat status<br align="left"/>shore/missions/ · mission list<br align="left"/></font>>];
   }
 
   subgraph cluster_links {
-    label="Satellite links (proxy.py)"; style="rounded,dashed"; color=gray50;
+    label="Satellite links (proxy.py) · simulation only: kill a proxy = that link is down"; style="rounded,dashed"; color=gray50;
     pstar [label="Starlink proxy\n:8001"];
     pirid [label="Iridium proxy\n:8002"];
   }
 
   subgraph cluster_boat {
-    label="Boat computer (service/)"; style=rounded;
-    links   [label="Links\nlinks.py", group=main];
-    control [label="Control loop\ncontrol_loop.py", fillcolor="#e8f0fe", group=main];
-    planner [label="Planner\nplanner.py"];
-    bridge  [label="MAVLink bridge\nbridge.py", group=main];
+    label="Boat computer · scout-lowpower.service (systemd)"; style=rounded;
+    links   [label=<<b>Links</b> · links.py<br/><font point-size="11">store and forward, one queue + thread per link;<br/>boat starts every exchange, keeps data queued while a link is down</font>>, group=main];
+    control [label=<<b>Control loop</b> · control_loop.py<br/><font point-size="11">main loop: state machine, sends only what differs<br/>from the plan each tick, resumes after restarts</font>>, fillcolor="#e8f0fe", group=main];
+    planner [label=<<b>Planner</b> · planner.py<br/><font point-size="11">forecast + mission → hourly speeds</font>>];
+    bridge  [label=<<b>MAVLink bridge</b> · bridge.py<br/><font point-size="11">only part that talks to the autopilot;<br/>detects autopilot reboots</font>>, group=main];
+    model   [label=<<b>Energy model</b> · forecast/model.py<br/><font point-size="11">load + solar + battery → voltage<br/>planner feeds it the weather <b>forecast</b></font>>];
+    boatdb  [shape=cylinder, style=filled, fillcolor="#f1f1f1", width=2.4,
+             label=<<b>service/state/</b><br align="left"/><font point-size="11">mission.json · mission<br align="left"/>forecast.csv · weather forecast<br align="left"/>plan.json · hourly speeds<br align="left"/>prediction.json · expected V<br align="left"/>progress.json · next waypoint<br align="left"/></font>>];
+    journal [shape=note, style=filled, fillcolor="#f1f1f1", width=2.4,
+             label=<<b>journald</b><br/><font point-size="11">every module logs through log.py<br/>to stdout → journalctl -u scout-lowpower</font>>];
   }
 
   subgraph cluster_sim {
     label="Simulator (sim/)"; style="rounded,dashed"; color=gray50;
-    sitl   [label="Autopilot\nArduPilot SITL", group=main];
-    envsim [label="Environment\nenv_sim.py"];
+    sitl   [label=<<b>Autopilot</b> · ArduPilot SITL<br/><font point-size="11">software in the loop (Rover)</font>>, group=main];
+    envsim [label=<<b>Environment sim</b> · env_sim.py<br/><font point-size="11">same energy model (own copy of the numbers),<br/>fed the <b>true</b> weather (ERA5 reanalysis)</font>>];
+    simdb  [shape=cylinder, style=filled, fillcolor="#f1f1f1", width=2.4,
+            label=<<b>sim/state/world.json</b> · resume<br align="left"/><font point-size="11">autopilot time · battery OCV, V, Wh<br align="left"/>lat / lon · Starlink on/off<br align="left"/>(+ SITL eeprom.bin: mission, params)<br align="left"/></font>>];
   }
 
   browser -> server  [label="  HTTP /api\n  telemetry · plan · send mission"];
+  server  -> shoredb [label="read / write", dir=forward];
   server  -> pstar   [label="HTTP  "];
   server  -> pirid   [label="  HTTP"];
   pstar   -> links   [label="HTTP :8001  \nonly when Starlink on  \nup: full data, plan  \ndown: mission, start, abort  "];
   pirid   -> links   [label="  HTTP :8002, every 5 min\n  up: 5 points + status\n  down: wake, start, abort"];
   links   -> control [label="  in-memory queues"];
-  control -> planner [label="hourly\nspeeds"];
+  control -> planner [label="mission +\nforecast  →\n←  plan"];
+  planner -> model   [label="  forecast weather\n  + speeds → V", dir=forward];
+  boatdb  -> planner [label="  writes plan", dir=back];
+  envsim  -> model   [label="same model,\ntrue weather", style=dashed, dir=forward, constraint=false];
+  boatdb  -> control [label="reads plan,\nmission, progress  ", dir=both];
+  journal -> control [label="logs", dir=back, style=dashed];
   control -> bridge  [label="  mode · speed · waypoints\n  Starlink relay"];
   bridge  -> sitl    [label="  MAVLink\n  udp:14551 (via MAVProxy)"];
   sitl    -> envsim  [label="MAVLink, SERIAL1 tcp:5762\nthrottle · Starlink → \n← battery V, load, solar"];
+  envsim  -> simdb   [label="  every 10 s", dir=forward];
 
+  { rank=same; server; shoredb; }
   { rank=same; pstar; pirid; }
-  { rank=same; control; planner; }
+  { rank=same; links; boatdb; }
+  { rank=same; journal; control; planner; }
+  { rank=same; bridge; model; }
   { rank=same; sitl; envsim; }
 }

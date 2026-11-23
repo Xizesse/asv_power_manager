@@ -1,16 +1,28 @@
-// Forecast model (forecast/model.py)
+// Forecast model (forecast/model.py). Grey dashed = not implemented.
 digraph forecast {
-  rankdir=TB; nodesep=0.5; ranksep=0.5;
+  rankdir=TB; nodesep=0.45; ranksep=0.6;
   graph [fontname="Helvetica", fontsize=18, labeljust=l];
-  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=3.5];
+  node  [shape=box, style="rounded,filled", fillcolor=white, fontname="Helvetica", fontsize=16, width=2.6];
   edge  [fontname="Helvetica", fontsize=13, fontcolor="#1a5fb4", color=gray35, penwidth=1.3, arrowsize=0.7];
-  mission [label="Mission\nmode · speed", fillcolor="#fef7e0"];
-  plan    [label="Starlink\nschedule", fillcolor="#fef7e0"];
-  sun     [label="Solar\nforecast", fillcolor="#fef7e0"];
-  load  [label="Load\n10 + 22·Starlink + k·v² W"];
-  solar [label="Solar\none curve per day"];
-  batt  [label="Battery\nenergy in − out → V", fillcolor="#e8f0fe"];
+
+  mission [label=<<b>Mission</b><br/><font point-size="13">mode, desired speeds</font>>, fillcolor="#fef7e0"];
+  sched   [label=<<b>Starlink</b><br/><font point-size="13">schedule</font>>, fillcolor="#fef7e0"];
+  wind    [label=<<b>Wind &amp; current</b><br/><font point-size="13">forecast</font>>, style="rounded,dashed", color=gray60, fontcolor=gray55];
+  irr     [label=<<b>Solar irradiance</b><br/><font point-size="13">forecast, W/m² (weather model)</font>>, fillcolor="#fef7e0"];
+
+  load  [label=<<b>Load</b><br/><font point-size="13">P<sub>hotel</sub> + P<sub>Starlink</sub>(schedule) + P<sub>motor</sub>(mission, v)</font><font point-size="13" color="gray55"> + P<sub>wind, current</sub></font>>];
+  solar [label=<<b>Solar power</b><br/><font point-size="13">forecast, W: irradiance × panel effective area</font>>];
+  batt  [label=<<b>Battery</b><br/><font point-size="13">V = f(energy in − energy out)</font>>, fillcolor="#e8f0fe"];
   out   [label="Voltage every minute"];
-  mission -> load; plan -> load; sun -> solar;
+
+  legend [label="not implemented", style="rounded,dashed", color=gray60, fontcolor=gray55, fontsize=12, width=1.6, height=0.35];
+
+  mission -> load; sched -> load;
+  wind -> load [style=dashed, color=gray60];
+  irr -> solar;
   load -> batt; solar -> batt; batt -> out;
+
+  { rank=same; mission; sched; wind; irr; }
+  { rank=same; out; legend; }
+  out -> legend [style=invis];
 }

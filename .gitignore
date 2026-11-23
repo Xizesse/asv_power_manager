@@ -3,8 +3,10 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 claude/
-data/
-data/
+# data: only the small files the code needs (telemetry CSV stays out)
+data/*
+!data/mission/
+!data/weather/
 sim/sitl_run/
 sim/logs/
 shore/data/
@@ -13,3 +15,7 @@ claude/
 service/state/
 sim/state/
 forecast/output/
+
+# deliverables: only the PDF is tracked
+deliverables/*
+!deliverables/writeup.pdf
